@@ -1968,4 +1968,223 @@ async fn test_multiple_refreshes_maintain_chain() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+// Google OAuth tests with mocked Google server
+use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{method, path, query_param};
+
+// Unit tests for Google OAuth verification with mocked server
+#[tokio::test]
+async fn test_verify_google_id_token_success() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let mock_server = MockServer::start().await;
+    let client_id = "test-google-client-id-12345";
+    std::env::set_var("GOOGLE_OAUTH_CLIENT_ID", client_id);
+    
+    let test_email = "test@gmail.com";
+    let test_token = "valid_token_123";
+    
+    Mock::given(method("GET"))
+        .and(path("/tokeninfo"))
+        .and(query_param("id_token", test_token))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "email": test_email,
+            "email_verified": true,
+            "aud": client_id,
+            "sub": "user123"
+        })))
+        .mount(&mock_server)
+        .await;
+    
+    let base_url = format!("http://{}", mock_server.address());
+    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), test_email);
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_verify_google_id_token_unverified_email() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let mock_server = MockServer::start().await;
+    let client_id = "test-google-client-id-12345";
+    std::env::set_var("GOOGLE_OAUTH_CLIENT_ID", client_id);
+    
+    let test_token = "unverified_token";
+    
+    Mock::given(method("GET"))
+        .and(path("/tokeninfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "email": "unverified@gmail.com",
+            "email_verified": false,
+            "aud": client_id,
+            "sub": "user123"
+        })))
+        .mount(&mock_server)
+        .await;
+    
+    let base_url = format!("http://{}", mock_server.address());
+    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        iam::IamError::OAuthEmailNotVerified => {}
+        e => panic!("Expected OAuthEmailNotVerified, got {:?}", e),
+    }
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_verify_google_id_token_audience_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let mock_server = MockServer::start().await;
+    let client_id = "test-google-client-id-12345";
+    std::env::set_var("GOOGLE_OAUTH_CLIENT_ID", client_id);
+    
+    let test_token = "wrong_audience_token";
+    
+    Mock::given(method("GET"))
+        .and(path("/tokeninfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "email": "test@gmail.com",
+            "email_verified": true,
+            "aud": "different-client-id",
+            "sub": "user123"
+        })))
+        .mount(&mock_server)
+        .await;
+    
+    let base_url = format!("http://{}", mock_server.address());
+    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        iam::IamError::InvalidOAuthToken => {}
+        e => panic!("Expected InvalidOAuthToken, got {:?}", e),
+    }
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_verify_google_id_token_invalid_response() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let mock_server = MockServer::start().await;
+    let client_id = "test-google-client-id-12345";
+    std::env::set_var("GOOGLE_OAUTH_CLIENT_ID", client_id);
+    
+    let test_token = "invalid_token";
+    
+    Mock::given(method("GET"))
+        .and(path("/tokeninfo"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&mock_server)
+        .await;
+    
+    let base_url = format!("http://{}", mock_server.address());
+    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        iam::IamError::InvalidOAuthToken => {}
+        e => panic!("Expected InvalidOAuthToken, got {:?}", e),
+    }
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_verify_google_id_token_missing_client_id() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    // Remove the environment variable
+    std::env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
+    
+    let result = iam::google_oauth::verify_google_id_token("any_token").await;
+    
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        iam::IamError::InvalidOAuthToken => {}
+        e => panic!("Expected InvalidOAuthToken, got {:?}", e),
+    }
+    
+    // Restore for other tests
+    std::env::set_var("GOOGLE_OAUTH_CLIENT_ID", "test-client-id");
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_google_oauth_register() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let (auth, _sent_codes) = setup_auth_service().await?;
+    
+    let email = "google.register@gmail.com";
+    
+    // Register with Google auth type
+    let account = auth.register_with_auth_type(email, "", iam::AuthType::Google).await?;
+    
+    assert_eq!(account.email, email);
+    assert_eq!(account.auth_type, iam::AuthType::Google);
+    assert!(account.email_verified); // Google accounts are auto-verified
+    assert_eq!(account.password_hash, ""); // No password for Google accounts
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_google_oauth_auth_type_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let (auth, sent_codes) = setup_auth_service().await?;
+    
+    let email = "mismatch@example.com";
+    let password = "ComplexStr0ng!";
+    
+    // Create an email account
+    let account = auth.register(email, password).await?;
+    let (_, code) = {
+        let guard = sent_codes
+            .lock()
+            .expect("poisoned TestEmailSender mutex");
+        guard
+            .clone()
+            .expect("verification email was not sent")
+    };
+    auth.verify_email(account.id, &code).await?;
+    
+    // Verify the account has Email auth type
+    let found_account = auth.get_account(account.id).await?;
+    assert_eq!(found_account.auth_type, iam::AuthType::Email);
+    
+    // Try to register with Google using the same email - should fail (email already exists)
+    let result = auth.register_with_auth_type(email, "", iam::AuthType::Google).await;
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        iam::IamError::Db(_) => {} // Database constraint violation
+        e => panic!("Expected database error, got {:?}", e),
+    }
+    
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_google_oauth_account_auto_verified() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
+    let (auth, _sent_codes) = setup_auth_service().await?;
+    
+    let email = "auto.verified@gmail.com";
+    
+    // Register with Google - should be automatically verified
+    let account = auth.register_with_auth_type(email, "", iam::AuthType::Google).await?;
+    
+    assert!(account.email_verified, "Google accounts should be auto-verified");
+    assert_eq!(account.auth_type, iam::AuthType::Google);
+    
+    // Should be able to login immediately (no email verification needed)
+    // Note: Full login test would require mocking Google token validation
+    
+    Ok(())
+}
+
 

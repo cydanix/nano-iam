@@ -10,8 +10,9 @@ use tracing::{error, warn, info, debug};
 
 use crate::email::EmailSender;
 use crate::errors::IamError;
+use crate::google_oauth::verify_google_id_token;
 use crate::locks::{LeaseLock, with_lock};
-use crate::models::{Account, AccountId, TokenPair, TokenType};
+use crate::models::{Account, AccountId, AuthType, TokenPair, TokenType};
 use crate::repo::Repo;
 use crate::retry::retry;
 use crate::tokens::generate_token_pair;
@@ -206,17 +207,35 @@ impl AuthService {
         email: &str,
         password: &str,
     ) -> Result<Account, IamError> {
-        info!(email = %email, "Registering new account");
-        
-        self.validate_password_complexity(password)?;
+        self.register_with_auth_type(email, password, AuthType::Email).await
+    }
+
+    pub async fn register_with_auth_type(
+        &self,
+        email: &str,
+        password: &str,
+        auth_type: AuthType,
+    ) -> Result<Account, IamError> {
+        info!(email = %email, auth_type = ?auth_type, "Registering new account");
         
         let now = self.now();
-        let password_hash = self.hash_password(password)?;
+        let password_hash = match auth_type {
+            AuthType::Email => {
+                self.validate_password_complexity(password)?;
+                self.hash_password(password)?
+            }
+            AuthType::Google => {
+                // For Google OAuth, password is the ID token
+                // We'll verify it and extract email, but don't store password hash
+                // Use a placeholder hash since the field is required
+                String::new()
+            }
+        };
 
         // Retry database operations that may fail due to transient errors
         let account = retry(|| async {
             self.repo
-                .create_account(email, &password_hash, now)
+                .create_account(email, &password_hash, auth_type, now)
                 .await
                 .map_err(|e| {
                     error!(email = %email, error = %e, "Failed to create account");
@@ -225,28 +244,31 @@ impl AuthService {
         })
         .await?;
 
-        let code =
-            self.generate_verification_code(self.cfg.email_verification.code_length);
-        let expires_at = now + self.cfg.email_verification.code_ttl;
+        // Only send verification email for email-based accounts
+        if auth_type == AuthType::Email {
+            let code =
+                self.generate_verification_code(self.cfg.email_verification.code_length);
+            let expires_at = now + self.cfg.email_verification.code_ttl;
 
-        retry(|| async {
-            self.repo
-                .create_email_verification(account.id, &code, expires_at, now)
+            retry(|| async {
+                self.repo
+                    .create_email_verification(account.id, &code, expires_at, now)
+                    .await
+                    .map_err(|e| {
+                        error!(account_id = %account.id, error = %e, "Failed to create email verification");
+                        e
+                    })
+            })
+            .await?;
+
+            self.email_sender
+                .send_verification_email(&account.email, &code, self.cfg.service_name.as_deref())
                 .await
                 .map_err(|e| {
-                    error!(account_id = %account.id, error = %e, "Failed to create email verification");
+                    error!(email = %account.email, error = %e, "Failed to send verification email");
                     e
-                })
-        })
-        .await?;
-
-        self.email_sender
-            .send_verification_email(&account.email, &code, self.cfg.service_name.as_deref())
-            .await
-            .map_err(|e| {
-                error!(email = %account.email, error = %e, "Failed to send verification email");
-                e
-            })?;
+                })?;
+        }
 
         info!(account_id = %account.id, email = %account.email, "Account registered successfully");
         Ok(account)
@@ -321,28 +343,84 @@ impl AuthService {
         email: &str,
         password: &str,
     ) -> Result<LoginResult, IamError> {
-        debug!(email = %email, "Attempting login");
+        self.login_with_auth_type(email, password, AuthType::Email).await
+    }
+
+    pub async fn login_with_auth_type(
+        &self,
+        email_or_token: &str,
+        password_or_id_token: &str,
+        auth_type: AuthType,
+    ) -> Result<LoginResult, IamError> {
+        debug!(auth_type = ?auth_type, "Attempting login");
+        
+        let email = match auth_type {
+            AuthType::Google => {
+                // For Google OAuth, password_or_id_token is the Google ID token
+                verify_google_id_token(password_or_id_token).await?
+            }
+            AuthType::Email => {
+                email_or_token.to_string()
+            }
+        };
+
         let account = self
             .repo
-            .find_account_by_email(email)
+            .find_account_by_email(&email)
             .await
             .map_err(|e| {
                 error!(email = %email, error = %e, "Database error during login");
                 e
-            })?
-            .ok_or_else(|| {
-                warn!(email = %email, "Login failed: account not found");
-                IamError::InvalidCredentials
             })?;
+
+        // If account doesn't exist and it's Google OAuth, create it automatically
+        let account = match account {
+            Some(acc) => acc,
+            None => {
+                if auth_type == AuthType::Google {
+                    // Auto-create account for Google OAuth (email is already verified by Google)
+                    info!(email = %email, "Auto-creating account for Google OAuth");
+                    let now = self.now();
+                    retry(|| async {
+                        self.repo
+                            .create_account(&email, "", AuthType::Google, now)
+                            .await
+                            .map_err(|e| {
+                                error!(email = %email, error = %e, "Failed to create Google OAuth account");
+                                e
+                            })
+                    })
+                    .await?
+                } else {
+                    warn!(email = %email, "Login failed: account not found");
+                    return Err(IamError::InvalidCredentials);
+                }
+            }
+        };
+
+        // Verify auth type matches
+        if account.auth_type != auth_type {
+            warn!(
+                account_id = %account.id,
+                email = %email,
+                account_auth_type = ?account.auth_type,
+                requested_auth_type = ?auth_type,
+                "Login failed: account has different authentication type"
+            );
+            return Err(IamError::AuthTypeMismatch);
+        }
 
         if !account.email_verified {
             warn!(account_id = %account.id, email = %email, "Login failed: email not verified");
             return Err(IamError::EmailNotVerified);
         }
 
-        if !self.verify_password(password, &account.password_hash)? {
-            warn!(account_id = %account.id, email = %email, "Login failed: invalid password");
-            return Err(IamError::InvalidCredentials);
+        // Verify password for email-based accounts
+        if auth_type == AuthType::Email {
+            if !self.verify_password(password_or_id_token, &account.password_hash)? {
+                warn!(account_id = %account.id, email = %email, "Login failed: invalid password");
+                return Err(IamError::InvalidCredentials);
+            }
         }
 
         let tokens = self.issue_tokens_for_account(account.id).await

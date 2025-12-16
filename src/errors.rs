@@ -46,5 +46,14 @@ pub enum IamError {
 
     #[error("refresh token double usage detected - token may be compromised")]
     TokenReuseDetected,
+
+    #[error("invalid OAuth token")]
+    InvalidOAuthToken,
+
+    #[error("OAuth account email not verified")]
+    OAuthEmailNotVerified,
+
+    #[error("account has different authentication type")]
+    AuthTypeMismatch,
 }
 

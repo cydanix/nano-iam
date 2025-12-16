@@ -4,7 +4,7 @@ use uuid::Uuid;
 use tracing::{error, warn, info, debug};
 
 use crate::errors::IamError;
-use crate::models::{Account, AccountId, EmailVerification, Token, TokenType};
+use crate::models::{Account, AccountId, AuthType, EmailVerification, Token, TokenType};
 use crate::retry::retry;
 use crate::locks::{LeaseLock, with_lock};
 
@@ -23,18 +23,21 @@ impl Repo {
         &self,
         email: &str,
         password_hash: &str,
+        auth_type: crate::models::AuthType,
         now: DateTime<Utc>,
     ) -> Result<Account, IamError> {
         let rec = sqlx::query_as::<_, Account>(
             r#"
-insert into accounts (id, email, password_hash, email_verified, created_at, updated_at, deleted_at)
-values ($1, $2, $3, false, $4, $4, null)
-returning id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+insert into accounts (id, email, password_hash, email_verified, auth_type, created_at, updated_at, deleted_at)
+values ($1, $2, $3, $4, $5, $6, $6, null)
+returning id, email, password_hash, email_verified, auth_type, created_at, updated_at, deleted_at
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(email)
         .bind(password_hash)
+        .bind(matches!(auth_type, AuthType::Google)) // Google accounts are pre-verified
+        .bind(auth_type)
         .bind(now)
         .fetch_one(&self.pool)
         .await
@@ -52,7 +55,7 @@ returning id, email, password_hash, email_verified, created_at, updated_at, dele
     ) -> Result<Option<Account>, IamError> {
         let rec = sqlx::query_as::<_, Account>(
             r#"
-select id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+select id, email, password_hash, email_verified, auth_type, created_at, updated_at, deleted_at
 from accounts
 where email = $1
   and deleted_at is null
@@ -75,7 +78,7 @@ where email = $1
     ) -> Result<Option<Account>, IamError> {
         let rec = sqlx::query_as::<_, Account>(
             r#"
-select id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+select id, email, password_hash, email_verified, auth_type, created_at, updated_at, deleted_at
 from accounts
 where email = $1
             "#,
@@ -97,7 +100,7 @@ where email = $1
     ) -> Result<Option<Account>, IamError> {
         let rec = sqlx::query_as::<_, Account>(
             r#"
-select id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+select id, email, password_hash, email_verified, auth_type, created_at, updated_at, deleted_at
 from accounts
 where id = $1
   and deleted_at is null
@@ -120,7 +123,7 @@ where id = $1
     ) -> Result<Option<Account>, IamError> {
         let rec = sqlx::query_as::<_, Account>(
             r#"
-select id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+select id, email, password_hash, email_verified, auth_type, created_at, updated_at, deleted_at
 from accounts
 where id = $1
             "#,
@@ -512,6 +515,7 @@ limit 1
     /// 
     /// It will create:
     /// - `token_type` enum type
+    /// - `auth_type` enum type
     /// - `accounts` table
     /// - `tokens` table
     /// - `email_verifications` table
@@ -564,13 +568,21 @@ limit 1
                 r#"
                 do $$
                 begin
-                    -- Create enum type if it doesn't exist
+                    -- Create enum types if they don't exist
                     if not exists (
                         select 1 from pg_type 
                         where typname = 'token_type' 
                         and typtype = 'e'
                     ) then
                         create type token_type as enum ('access', 'refresh');
+                    end if;
+                    
+                    if not exists (
+                        select 1 from pg_type 
+                        where typname = 'auth_type' 
+                        and typtype = 'e'
+                    ) then
+                        create type auth_type as enum ('email', 'google');
                     end if;
                     
                     -- Create accounts table
@@ -584,10 +596,21 @@ limit 1
                             email text not null unique,
                             password_hash text not null,
                             email_verified boolean not null default false,
+                            auth_type auth_type not null default 'email',
                             created_at timestamptz not null,
                             updated_at timestamptz not null,
                             deleted_at timestamptz
                         );
+                    end if;
+                    
+                    -- Add auth_type column if it doesn't exist (for existing databases)
+                    if not exists (
+                        select 1 from information_schema.columns 
+                        where table_schema = 'public' 
+                        and table_name = 'accounts' 
+                        and column_name = 'auth_type'
+                    ) then
+                        alter table accounts add column auth_type auth_type not null default 'email';
                     end if;
                     
                     -- Create tokens table
@@ -666,7 +689,7 @@ limit 1
         debug!("Verifying schema existence");
         
         // Check if token_type enum exists
-        let enum_exists: bool = sqlx::query_scalar(
+        let token_type_exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_type 
                 WHERE typname = 'token_type' 
@@ -676,11 +699,30 @@ limit 1
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            error!(error = %e, "Failed to verify enum type");
+            error!(error = %e, "Failed to verify token_type enum");
             IamError::Db(e)
         })?;
 
-        if !enum_exists {
+        if !token_type_exists {
+            return Err(IamError::Db(sqlx::Error::RowNotFound));
+        }
+
+        // Check if auth_type enum exists
+        let auth_type_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM pg_type 
+                WHERE typname = 'auth_type' 
+                AND typtype = 'e'
+            )"
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to verify auth_type enum");
+            IamError::Db(e)
+        })?;
+
+        if !auth_type_exists {
             return Err(IamError::Db(sqlx::Error::RowNotFound));
         }
 

@@ -6,6 +6,7 @@ pub mod repo;
 pub mod service;
 pub mod locks;
 pub mod retry;
+pub mod google_oauth;
 
 pub use crate::errors::IamError;
 pub use crate::service::{
@@ -17,7 +18,7 @@ pub use crate::service::{
     LoginResult,
     RefreshResult,
 };
-pub use crate::models::{Account, AccountId, Token};
+pub use crate::models::{Account, AccountId, AuthType, Token};
 pub use crate::locks::LeaseLock;
 pub use crate::repo::Repo;
 

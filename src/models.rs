@@ -10,6 +10,7 @@ pub struct Account {
     pub email: String,
     pub password_hash: String,
     pub email_verified: bool,
+    pub auth_type: AuthType,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -87,5 +88,13 @@ pub struct TokenPair {
 pub enum TokenType {
     Access,
     Refresh,
+}
+
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[sqlx(type_name = "auth_type", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum AuthType {
+    Email,
+    Google,
 }
 

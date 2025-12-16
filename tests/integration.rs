@@ -1,15 +1,16 @@
 use std::sync::{Arc, Mutex, Once};
 
 use chrono::Duration;
-use iam::{
+use nano_iam::{
     AuthConfig,
     AuthService,
     EmailVerificationConfig,
+    IamError,
     TokenConfig,
 };
-use iam::email::EmailSender;
-use iam::locks::{LeaseLock, with_lock};
-use iam::repo::Repo;
+use nano_iam::email::EmailSender;
+use nano_iam::locks::{LeaseLock, with_lock};
+use nano_iam::repo::Repo;
 use async_trait::async_trait;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Pool;
@@ -23,7 +24,7 @@ type PgPool = Pool<Postgres>;
 // Usage:
 //   RUST_LOG=debug cargo test -- --nocapture
 //   RUST_LOG=trace cargo test --test integration -- --nocapture
-//   RUST_LOG=iam::service=debug cargo test -- --nocapture
+//   RUST_LOG=nano_iam::service=debug cargo test -- --nocapture
 static INIT_TRACING: Once = Once::new();
 
 fn init_tracing() {
@@ -62,7 +63,7 @@ impl EmailSender for TestEmailSender {
         to: &str,
         code: &str,
         _service_name: Option<&str>,
-    ) -> Result<(), iam::IamError> {
+    ) -> Result<(), nano_iam::IamError> {
         let mut guard = self
             .last
             .lock()
@@ -76,7 +77,7 @@ impl EmailSender for TestEmailSender {
         to: &str,
         code: &str,
         _service_name: Option<&str>,
-    ) -> Result<(), iam::IamError> {
+    ) -> Result<(), nano_iam::IamError> {
         let mut guard = self
             .last
             .lock()
@@ -95,7 +96,7 @@ async fn setup_db() -> Result<PgPool, Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
 
-    let repo = iam::Repo::new(pool.clone());
+    let repo = nano_iam::Repo::new(pool.clone());
     
     // Use a lock to safely drop and recreate schema for test isolation
     // This prevents race conditions when tests run in parallel
@@ -121,13 +122,13 @@ async fn setup_db() -> Result<PgPool, Box<dyn std::error::Error>> {
         .await
         .map_err(|e| {
             eprintln!("Failed to drop tables: {}", e);
-            iam::IamError::Db(e)
+            IamError::Db(e)
         })?;
 
         // Create schema
         repo.create_schema().await?;
         
-        Ok::<(), iam::IamError>(())
+        Ok::<(), IamError>(())
     })
     .await
     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
@@ -317,7 +318,7 @@ async fn test_expired_access_token_fails_authentication(
         .await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::TokenExpired => {}
+        IamError::TokenExpired => {}
         e => panic!("Expected TokenExpired, got {:?}", e),
     }
 
@@ -367,7 +368,7 @@ async fn test_expired_refresh_token_fails_refresh(
         .await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::TokenExpired => {}
+        IamError::TokenExpired => {}
         e => panic!("Expected TokenExpired, got {:?}", e),
     }
 
@@ -407,7 +408,7 @@ async fn test_refresh_token_revoked_after_use(
     let result = auth.refresh(&refresh_token).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::TokenExpired => {}
+        IamError::TokenExpired => {}
         e => panic!("Expected TokenExpired (token was revoked), got {:?}", e),
     }
 
@@ -671,7 +672,7 @@ async fn test_delete_account_soft_deletes() -> Result<(), Box<dyn std::error::Er
     let result = auth.get_account(account.id).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::AccountNotFound => {}
+        IamError::AccountNotFound => {}
         e => panic!("Expected AccountNotFound, got {:?}", e),
     }
 
@@ -679,7 +680,7 @@ async fn test_delete_account_soft_deletes() -> Result<(), Box<dyn std::error::Er
     let login_result = auth.login(email, password).await;
     assert!(login_result.is_err());
     match login_result.unwrap_err() {
-        iam::IamError::InvalidCredentials => {}
+        IamError::InvalidCredentials => {}
         e => panic!("Expected InvalidCredentials, got {:?}", e),
     }
 
@@ -716,7 +717,7 @@ async fn test_delete_account_invalid_password() -> Result<(), Box<dyn std::error
     let result = auth.delete_account(account.id, "WrongPassword123!").await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidCredentials => {}
+        IamError::InvalidCredentials => {}
         e => panic!("Expected InvalidCredentials, got {:?}", e),
     }
 
@@ -762,7 +763,7 @@ async fn test_logout_revokes_access_token() -> Result<(), Box<dyn std::error::Er
     let result = auth.authenticate_access_token(&access_token).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::TokenExpired => {}
+        IamError::TokenExpired => {}
         e => panic!("Expected TokenExpired, got {:?}", e),
     }
 
@@ -842,7 +843,7 @@ async fn test_logout_all_invalid_password() -> Result<(), Box<dyn std::error::Er
     let result = auth.logout_all(account.id, "WrongPassword123!").await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidCredentials => {}
+        IamError::InvalidCredentials => {}
         e => panic!("Expected InvalidCredentials, got {:?}", e),
     }
 
@@ -885,7 +886,7 @@ async fn test_change_password() -> Result<(), Box<dyn std::error::Error>> {
     let login_result = auth.login(email, old_password).await;
     assert!(login_result.is_err());
     match login_result.unwrap_err() {
-        iam::IamError::InvalidCredentials => {}
+        IamError::InvalidCredentials => {}
         e => panic!("Expected InvalidCredentials, got {:?}", e),
     }
 
@@ -897,7 +898,7 @@ async fn test_change_password() -> Result<(), Box<dyn std::error::Error>> {
     let result = auth.authenticate_access_token(&access_token).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::TokenExpired => {}
+        IamError::TokenExpired => {}
         e => panic!("Expected TokenExpired, got {:?}", e),
     }
 
@@ -929,7 +930,7 @@ async fn test_change_password_invalid_old_password() -> Result<(), Box<dyn std::
     let result = auth.change_password(account.id, "WrongPassword123!", new_password).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidCredentials => {}
+        IamError::InvalidCredentials => {}
         e => panic!("Expected InvalidCredentials, got {:?}", e),
     }
 
@@ -964,7 +965,7 @@ async fn test_change_password_weak_new_password() -> Result<(), Box<dyn std::err
     let result = auth.change_password(account.id, password, "weak").await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::WeakPassword(_) => {}
+        IamError::WeakPassword(_) => {}
         e => panic!("Expected WeakPassword, got {:?}", e),
     }
 
@@ -1022,7 +1023,7 @@ async fn test_request_password_reset_nonexistent_email() -> Result<(), Box<dyn s
     let result = auth.request_password_reset("nonexistent@example.com").await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::AccountNotFound => {}
+        IamError::AccountNotFound => {}
         e => panic!("Expected AccountNotFound, got {:?}", e),
     }
 
@@ -1074,7 +1075,7 @@ async fn test_reset_password() -> Result<(), Box<dyn std::error::Error>> {
     let login_result = auth.login(email, old_password).await;
     assert!(login_result.is_err());
     match login_result.unwrap_err() {
-        iam::IamError::InvalidCredentials => {}
+        IamError::InvalidCredentials => {}
         e => panic!("Expected InvalidCredentials, got {:?}", e),
     }
 
@@ -1086,7 +1087,7 @@ async fn test_reset_password() -> Result<(), Box<dyn std::error::Error>> {
     let result = auth.authenticate_access_token(&access_token).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::TokenExpired => {}
+        IamError::TokenExpired => {}
         e => panic!("Expected TokenExpired, got {:?}", e),
     }
 
@@ -1121,7 +1122,7 @@ async fn test_reset_password_invalid_code() -> Result<(), Box<dyn std::error::Er
     let result = auth.reset_password(email, "000000", new_password).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidVerificationCode | iam::IamError::VerificationCodeExpired => {}
+        IamError::InvalidVerificationCode | IamError::VerificationCodeExpired => {}
         e => panic!("Expected InvalidVerificationCode or VerificationCodeExpired, got {:?}", e),
     }
 
@@ -1169,7 +1170,7 @@ async fn test_reset_password_weak_password() -> Result<(), Box<dyn std::error::E
     let result = auth.reset_password(email, &reset_code, "weak").await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::WeakPassword(_) => {}
+        IamError::WeakPassword(_) => {}
         e => panic!("Expected WeakPassword, got {:?}", e),
     }
 
@@ -1259,7 +1260,7 @@ async fn test_resend_verification_email_already_verified() -> Result<(), Box<dyn
     let result = auth.resend_verification_email(email).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::EmailAlreadyVerified => {}
+        IamError::EmailAlreadyVerified => {}
         e => panic!("Expected EmailAlreadyVerified, got {:?}", e),
     }
 
@@ -1328,7 +1329,7 @@ async fn test_get_account_not_found() -> Result<(), Box<dyn std::error::Error>> 
     let result = auth.get_account(nonexistent_id).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::AccountNotFound => {}
+        IamError::AccountNotFound => {}
         e => panic!("Expected AccountNotFound, got {:?}", e),
     }
 
@@ -1371,7 +1372,7 @@ async fn test_cleanup_expired_objects() -> Result<(), Box<dyn std::error::Error>
     let result = auth.get_account(account.id).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::AccountNotFound => {}
+        IamError::AccountNotFound => {}
         e => panic!("Expected AccountNotFound, got {:?}", e),
     }
 
@@ -1411,7 +1412,7 @@ async fn test_cleanup_expired_objects_with_retention() -> Result<(), Box<dyn std
     let result = auth.get_account(account.id).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::AccountNotFound => {}
+        IamError::AccountNotFound => {}
         e => panic!("Expected AccountNotFound, got {:?}", e),
     }
 
@@ -1449,7 +1450,7 @@ async fn test_get_account_after_soft_delete() -> Result<(), Box<dyn std::error::
     let result = auth.get_account(account.id).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::AccountNotFound => {}
+        IamError::AccountNotFound => {}
         e => panic!("Expected AccountNotFound, got {:?}", e),
     }
 
@@ -1504,8 +1505,8 @@ async fn test_check_email_available_after_soft_delete() -> Result<(), Box<dyn st
 async fn get_token_from_db(
     pool: &PgPool,
     token_value: &str,
-) -> Result<Option<iam::models::Token>, Box<dyn std::error::Error>> {
-    use iam::models::Token;
+) -> Result<Option<nano_iam::models::Token>, Box<dyn std::error::Error>> {
+    use nano_iam::models::Token;
     
     let row = sqlx::query_as::<_, Token>(
         r#"
@@ -1724,7 +1725,7 @@ async fn test_double_usage_detection_and_chain_revocation() -> Result<(), Box<dy
     
     // Check that it's TokenExpired (token was revoked after first use)
     match second_result.unwrap_err() {
-        iam::IamError::TokenExpired => {
+        IamError::TokenExpired => {
             // Expected - token was revoked after first use
         }
         e => panic!("Expected TokenExpired, got {:?}", e),
@@ -1770,7 +1771,7 @@ async fn test_double_usage_detection_and_chain_revocation() -> Result<(), Box<dy
                 "Token should be revoked after double usage detection"
             );
         }
-        Err(iam::IamError::TokenReuseDetected) => {
+        Err(IamError::TokenReuseDetected) => {
             // Expected - double usage was detected
             // Verify all tokens with same root_token are revoked
             let revoked_count: i64 = sqlx::query_scalar(
@@ -1874,7 +1875,7 @@ async fn test_token_chain_revocation_on_compromise() -> Result<(), Box<dyn std::
     
     // Should return TokenReuseDetected error
     match result {
-        Err(iam::IamError::TokenReuseDetected) => {
+        Err(IamError::TokenReuseDetected) => {
             // Expected - double usage detected
         }
         Ok(_) => {
@@ -1996,7 +1997,7 @@ async fn test_verify_google_id_token_success() -> Result<(), Box<dyn std::error:
         .await;
     
     let base_url = format!("http://{}", mock_server.address());
-    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    let result = nano_iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
     
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), test_email);
@@ -2025,11 +2026,11 @@ async fn test_verify_google_id_token_unverified_email() -> Result<(), Box<dyn st
         .await;
     
     let base_url = format!("http://{}", mock_server.address());
-    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    let result = nano_iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
     
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::OAuthEmailNotVerified => {}
+        IamError::OAuthEmailNotVerified => {}
         e => panic!("Expected OAuthEmailNotVerified, got {:?}", e),
     }
     
@@ -2057,11 +2058,11 @@ async fn test_verify_google_id_token_audience_mismatch() -> Result<(), Box<dyn s
         .await;
     
     let base_url = format!("http://{}", mock_server.address());
-    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    let result = nano_iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
     
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidOAuthToken => {}
+        IamError::InvalidOAuthToken => {}
         e => panic!("Expected InvalidOAuthToken, got {:?}", e),
     }
     
@@ -2084,11 +2085,11 @@ async fn test_verify_google_id_token_invalid_response() -> Result<(), Box<dyn st
         .await;
     
     let base_url = format!("http://{}", mock_server.address());
-    let result = iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
+    let result = nano_iam::google_oauth::verify_google_id_token_with_base_url(test_token, &base_url).await;
     
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidOAuthToken => {}
+        IamError::InvalidOAuthToken => {}
         e => panic!("Expected InvalidOAuthToken, got {:?}", e),
     }
     
@@ -2101,11 +2102,11 @@ async fn test_verify_google_id_token_missing_client_id() -> Result<(), Box<dyn s
     // Remove the environment variable
     std::env::remove_var("GOOGLE_OAUTH_CLIENT_ID");
     
-    let result = iam::google_oauth::verify_google_id_token("any_token").await;
+    let result = nano_iam::google_oauth::verify_google_id_token("any_token").await;
     
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::InvalidOAuthToken => {}
+        IamError::InvalidOAuthToken => {}
         e => panic!("Expected InvalidOAuthToken, got {:?}", e),
     }
     
@@ -2123,10 +2124,10 @@ async fn test_google_oauth_register() -> Result<(), Box<dyn std::error::Error>> 
     let email = "google.register@gmail.com";
     
     // Register with Google auth type
-    let account = auth.register_with_auth_type(email, "", iam::AuthType::Google).await?;
+    let account = auth.register_with_auth_type(email, "", nano_iam::AuthType::Google).await?;
     
     assert_eq!(account.email, email);
-    assert_eq!(account.auth_type, iam::AuthType::Google);
+    assert_eq!(account.auth_type, nano_iam::AuthType::Google);
     assert!(account.email_verified); // Google accounts are auto-verified
     assert_eq!(account.password_hash, ""); // No password for Google accounts
     
@@ -2155,13 +2156,13 @@ async fn test_google_oauth_auth_type_mismatch() -> Result<(), Box<dyn std::error
     
     // Verify the account has Email auth type
     let found_account = auth.get_account(account.id).await?;
-    assert_eq!(found_account.auth_type, iam::AuthType::Email);
+    assert_eq!(found_account.auth_type, nano_iam::AuthType::Email);
     
     // Try to register with Google using the same email - should fail (email already exists)
-    let result = auth.register_with_auth_type(email, "", iam::AuthType::Google).await;
+    let result = auth.register_with_auth_type(email, "", nano_iam::AuthType::Google).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        iam::IamError::Db(_) => {} // Database constraint violation
+        IamError::Db(_) => {} // Database constraint violation
         e => panic!("Expected database error, got {:?}", e),
     }
     
@@ -2176,10 +2177,10 @@ async fn test_google_oauth_account_auto_verified() -> Result<(), Box<dyn std::er
     let email = "auto.verified@gmail.com";
     
     // Register with Google - should be automatically verified
-    let account = auth.register_with_auth_type(email, "", iam::AuthType::Google).await?;
+    let account = auth.register_with_auth_type(email, "", nano_iam::AuthType::Google).await?;
     
     assert!(account.email_verified, "Google accounts should be auto-verified");
-    assert_eq!(account.auth_type, iam::AuthType::Google);
+    assert_eq!(account.auth_type, nano_iam::AuthType::Google);
     
     // Should be able to login immediately (no email verification needed)
     // Note: Full login test would require mocking Google token validation

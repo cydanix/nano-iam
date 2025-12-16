@@ -1067,7 +1067,7 @@ impl AuthService {
     /// 
     /// # Example
     /// ```rust,no_run
-    /// use iam::AuthService;
+    /// use nano_iam::AuthService;
     /// 
     /// # async fn example(auth: AuthService) -> Result<(), Box<dyn std::error::Error>> {
     /// // Cleanup with 30-day retention for soft-deleted accounts

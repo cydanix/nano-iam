@@ -359,6 +359,14 @@ impl AuthService {
         &self,
         account_id: AccountId,
     ) -> Result<TokenPair, IamError> {
+        self.issue_tokens_for_account_with_root_token(account_id, None).await
+    }
+
+    async fn issue_tokens_for_account_with_root_token(
+        &self,
+        account_id: AccountId,
+        root_token: Option<&str>,
+    ) -> Result<TokenPair, IamError> {
         debug!(account_id = %account_id, "Issuing tokens");
         let now = self.now();
         let pair = generate_token_pair(
@@ -366,7 +374,32 @@ impl AuthService {
             self.cfg.token.refresh_ttl,
         );
 
+        // Determine root_token: use provided one, or use refresh token value as root
+        let refresh_token_value = pair.refresh_token.as_str();
+        let root_token = root_token.unwrap_or(refresh_token_value);
+
         // Retry database operations that may fail due to transient errors
+        // Insert refresh token first with root_token
+        retry(|| async {
+            self.repo
+                .insert_token(
+                    account_id,
+                    refresh_token_value,
+                    TokenType::Refresh,
+                    pair.refresh_token_expires_at,
+                    now,
+                    Some(root_token),
+                    0, // Initial usage is 0
+                )
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to insert refresh token");
+                    e
+                })
+        })
+        .await?;
+
+        // Insert access token with the same root_token
         retry(|| async {
             self.repo
                 .insert_token(
@@ -375,27 +408,12 @@ impl AuthService {
                     TokenType::Access,
                     pair.access_token_expires_at,
                     now,
+                    Some(root_token),
+                    0, // Access tokens don't track usage
                 )
                 .await
                 .map_err(|e| {
                     error!(account_id = %account_id, error = %e, "Failed to insert access token");
-                    e
-                })
-        })
-        .await?;
-
-        retry(|| async {
-            self.repo
-                .insert_token(
-                    account_id,
-                    pair.refresh_token.as_str(),
-                    TokenType::Refresh,
-                    pair.refresh_token_expires_at,
-                    now,
-                )
-                .await
-                .map_err(|e| {
-                    error!(account_id = %account_id, error = %e, "Failed to insert refresh token");
                     e
                 })
         })
@@ -443,7 +461,57 @@ impl AuthService {
         })
         .await?;
 
-        // Retry database operations that may fail due to transient errors
+        // Increment usage counter and check for double usage
+        let updated_token = retry(|| async {
+            self.repo
+                .increment_token_usage(refresh_token, TokenType::Refresh)
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to increment token usage");
+                    e
+                })
+        })
+        .await?;
+
+        // Check for double usage (token reused in another location - compromised)
+        if updated_token.usage > 1 {
+            error!(
+                account_id = %updated_token.account_id,
+                root_token = ?updated_token.root_token,
+                usage = updated_token.usage,
+                "Refresh token double usage detected - token may be compromised"
+            );
+
+            // Revoke entire token chain if root_token exists
+            if let Some(ref root_token) = updated_token.root_token {
+                retry(|| async {
+                    self.repo
+                        .revoke_tokens_by_root_token(root_token, now)
+                        .await
+                        .map_err(|e| {
+                            error!(root_token = %root_token, error = %e, "Failed to revoke token chain");
+                            e
+                        })
+                })
+                .await?;
+            } else {
+                // Fallback: revoke just this token if no root_token
+                retry(|| async {
+                    self.repo
+                        .revoke_token(refresh_token, TokenType::Refresh, now)
+                        .await
+                        .map_err(|e| {
+                            error!(error = %e, "Failed to revoke compromised refresh token");
+                            e
+                        })
+                })
+                .await?;
+            }
+
+            return Err(IamError::TokenReuseDetected);
+        }
+
+        // Revoke the used refresh token (single-use token)
         retry(|| async {
             self.repo
                 .revoke_token(refresh_token, TokenType::Refresh, now)
@@ -468,7 +536,8 @@ impl AuthService {
                 IamError::AccountNotFound
             })?;
 
-        let tokens = self.issue_tokens_for_account(account.id).await
+        // Create new token pair with the same root_token
+        let tokens = self.issue_tokens_for_account_with_root_token(account.id, updated_token.root_token.as_deref()).await
             .map_err(|e| {
                 error!(account_id = %account.id, error = %e, "Failed to issue new tokens");
                 e

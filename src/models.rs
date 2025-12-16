@@ -34,6 +34,8 @@ pub struct Token {
     pub expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    pub root_token: Option<String>,
+    pub usage: i64,
 }
 
 impl Token {
@@ -48,6 +50,8 @@ impl Token {
             expires_at: Utc::now(),
             created_at: Utc::now(),
             revoked_at: None,
+            root_token: None,
+            usage: 0,
         }
     }
 

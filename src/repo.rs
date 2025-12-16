@@ -232,12 +232,14 @@ returning id
         token_type: TokenType,
         expires_at: DateTime<Utc>,
         now: DateTime<Utc>,
+        root_token: Option<&str>,
+        usage: i64,
     ) -> Result<Token, IamError> {
         let rec = sqlx::query_as::<_, Token>(
             r#"
-insert into tokens (id, account_id, token, token_type, expires_at, created_at, revoked_at)
-values ($1, $2, $3, $4, $5, $6, null)
-returning id, account_id, token, token_type, expires_at, created_at, revoked_at
+insert into tokens (id, account_id, token, token_type, expires_at, created_at, revoked_at, root_token, usage)
+values ($1, $2, $3, $4, $5, $6, null, $7, $8)
+returning id, account_id, token, token_type, expires_at, created_at, revoked_at, root_token, usage
             "#,
         )
         .bind(Uuid::new_v4())
@@ -246,6 +248,8 @@ returning id, account_id, token, token_type, expires_at, created_at, revoked_at
         .bind(token_type)
         .bind(expires_at)
         .bind(now)
+        .bind(root_token)
+        .bind(usage)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
@@ -264,7 +268,7 @@ returning id, account_id, token, token_type, expires_at, created_at, revoked_at
     ) -> Result<Token, IamError> {
         let rec = sqlx::query_as::<_, Token>(
             r#"
-select id, account_id, token, token_type, expires_at, created_at, revoked_at
+select id, account_id, token, token_type, expires_at, created_at, revoked_at, root_token, usage
 from tokens
 where token = $1
   and token_type = $2
@@ -369,6 +373,83 @@ where account_id = $1
         })?;
 
         Ok(())
+    }
+
+    pub async fn revoke_tokens_by_root_token(
+        &self,
+        root_token: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), IamError> {
+        sqlx::query(
+            r#"
+update tokens
+set revoked_at = $2
+where root_token = $1
+  and revoked_at is null
+            "#,
+        )
+        .bind(root_token)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(root_token = %root_token, error = %e, "Database error revoking tokens by root_token");
+            IamError::from(e)
+        })?;
+
+        Ok(())
+    }
+
+    pub async fn increment_token_usage(
+        &self,
+        token: &str,
+        token_type: TokenType,
+    ) -> Result<Token, IamError> {
+        // First increment the usage counter
+        sqlx::query(
+            r#"
+update tokens
+set usage = usage + 1
+where token = $1
+  and token_type = $2
+  and revoked_at is null
+            "#,
+        )
+        .bind(token)
+        .bind(token_type)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(token_type = ?token_type, error = %e, "Database error incrementing token usage");
+            IamError::from(e)
+        })?;
+
+        // Then fetch the updated token
+        let rec = sqlx::query_as::<_, Token>(
+            r#"
+select id, account_id, token, token_type, expires_at, created_at, revoked_at, root_token, usage
+from tokens
+where token = $1
+  and token_type = $2
+  and revoked_at is null
+            "#,
+        )
+        .bind(token)
+        .bind(token_type)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(token_type = ?token_type, error = %e, "Database error fetching token after usage increment");
+            IamError::from(e)
+        })?;
+
+        match rec {
+            Some(row) => Ok(row),
+            None => {
+                warn!(token_type = ?token_type, "Token not found after usage increment");
+                Err(IamError::TokenNotFound)
+            }
+        }
     }
 
     pub async fn update_password_hash(
@@ -522,8 +603,29 @@ limit 1
                             token_type token_type not null,
                             expires_at timestamptz not null,
                             created_at timestamptz not null,
-                            revoked_at timestamptz
+                            revoked_at timestamptz,
+                            root_token text,
+                            usage bigint not null default 0
                         );
+                    end if;
+                    
+                    -- Add root_token and usage columns if they don't exist (for existing databases)
+                    if not exists (
+                        select 1 from information_schema.columns 
+                        where table_schema = 'public' 
+                        and table_name = 'tokens' 
+                        and column_name = 'root_token'
+                    ) then
+                        alter table tokens add column root_token text;
+                    end if;
+                    
+                    if not exists (
+                        select 1 from information_schema.columns 
+                        where table_schema = 'public' 
+                        and table_name = 'tokens' 
+                        and column_name = 'usage'
+                    ) then
+                        alter table tokens add column usage bigint not null default 0;
                     end if;
                     
                     -- Create email_verifications table

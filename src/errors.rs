@@ -43,5 +43,8 @@ pub enum IamError {
 
     #[error("lock acquisition timeout")]
     LockTimeout,
+
+    #[error("refresh token double usage detected - token may be compromised")]
+    TokenReuseDetected,
 }
 

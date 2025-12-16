@@ -29,6 +29,8 @@ pub fn generate_token_pair(
             expires_at: access_expires_at,
             created_at: now,
             revoked_at: None,
+            root_token: None,
+            usage: 0,
         },
         access_token_expires_at: access_expires_at,
         refresh_token: Token {
@@ -39,6 +41,8 @@ pub fn generate_token_pair(
             expires_at: refresh_expires_at,
             created_at: now,
             revoked_at: None,
+            root_token: None,
+            usage: 0,
         },
         refresh_token_expires_at: refresh_expires_at,
     }

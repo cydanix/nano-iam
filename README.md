@@ -1,17 +1,58 @@
-## Rust IAM library
+# nano-iam
 
-This crate provides basic email+password authentication with:
+A lightweight, production-ready Rust library for Identity and Access Management (IAM) with PostgreSQL backend. Provides secure authentication, token management, and email verification for modern applications.
 
-- account storage in PostgreSQL
-- email verification codes
-- access and refresh tokens stored in PostgreSQL and checked on each request
+## Features
 
-### Database schema (SQLx)
+- **Multiple Authentication Methods**
+  - Email and password authentication with Argon2 password hashing
+  - Google OAuth integration via ID token verification
+  - Configurable password policies with complexity requirements
+
+- **Token Management**
+  - JWT-based access and refresh tokens
+  - Token storage in PostgreSQL for revocation and validation
+  - Automatic token expiration and refresh flow
+  - Protection against token reuse attacks
+
+- **Email Verification**
+  - Time-limited verification codes
+  - Automatic email sending via configurable `EmailSender` trait
+  - Built-in support for Lettre SMTP transport
+
+- **Database Integration**
+  - PostgreSQL storage with SQLx
+  - Programmatic schema creation
+  - Support for master-slave database setups
+
+- **Distributed System Support**
+  - Optional PostgreSQL advisory locks for distributed deployments
+  - Prevents race conditions in token refresh and email verification
+  - Safe for single-instance deployments without locks
+
+- **Production Ready**
+  - Automatic retry logic for transient database errors
+  - Comprehensive error handling
+  - Structured logging with tracing
+  - Configurable TTLs and security policies
+
+## Quick Start
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+nano-iam = { path = "../nano-iam" }
+# Or from crates.io when published
+# nano-iam = "0.1.0"
+```
+
+## Database Schema
 
 You can create the minimal schema programmatically using the `Repo::create_schema()` method:
 
 ```rust
-use iam::repo::Repo;
+use nano_iam::repo::Repo;
 use sqlx::postgres::PgPoolOptions;
 
 async fn setup_database(database_url: &str) -> anyhow::Result<()> {
@@ -37,8 +78,10 @@ create table accounts (
     email text not null unique,
     password_hash text not null,
     email_verified boolean not null default false,
+    auth_type text not null default 'email',
     created_at timestamptz not null,
-    updated_at timestamptz not null
+    updated_at timestamptz not null,
+    deleted_at timestamptz
 );
 
 create table tokens (
@@ -48,7 +91,9 @@ create table tokens (
     token_type token_type not null,
     expires_at timestamptz not null,
     created_at timestamptz not null,
-    revoked_at timestamptz
+    revoked_at timestamptz,
+    root_token text,
+    usage bigint not null default 0
 );
 
 create table email_verifications (
@@ -63,7 +108,7 @@ create table email_verifications (
 
 **Note:** The `create_schema()` method is idempotent and can be called multiple times safely.
 
-### Public API
+## Public API
 
 Main types to use:
 
@@ -72,20 +117,22 @@ Main types to use:
 - `LoginResult`, `RefreshResult`
 - `Account`, `AccountId`
 
+## Setup
+
 Construct the service (example with SQLx and lettre):
 
 ```rust
 use std::sync::Arc;
 
-use iam::{
+use nano_iam::{
     AuthConfig,
     AuthService,
     EmailVerificationConfig,
     TokenConfig,
     PasswordPolicy,
 };
-use iam::email::LettreEmailSender;
-use iam::repo::Repo;
+use nano_iam::email::LettreEmailSender;
+use nano_iam::repo::Repo;
 use chrono::Duration;
 use lettre::message::Mailbox;
 use lettre::AsyncSmtpTransport;
@@ -123,9 +170,18 @@ async fn build_auth_service(database_url: &str) -> anyhow::Result<AuthService> {
 }
 ```
 
-### Typical flows
+For distributed deployments, use `AuthService::with_locks()` to enable distributed locking:
 
-#### Register account
+```rust
+use nano_iam::locks::LeaseLock;
+
+let lock = LeaseLock::new(pool.clone()); // Must use same pool as repo
+let auth_service = AuthService::with_locks(repo, email_sender, cfg, lock);
+```
+
+## Typical Flows
+
+### Register Account (Email/Password)
 
 ```rust
 let account = auth_service
@@ -139,7 +195,23 @@ This will:
 - generate an email verification code and row
 - send an email with that code using `EmailSender`
 
-#### Verify email
+### Register Account (Google OAuth)
+
+```rust
+use nano_iam::models::AuthType;
+
+// Verify Google ID token first
+let email = nano_iam::google_oauth::verify_google_id_token(id_token).await?;
+
+// Register with Google auth type
+let account = auth_service
+    .register_with_auth_type(&email, "", AuthType::Google)
+    .await?;
+```
+
+**Note:** Set the `GOOGLE_OAUTH_CLIENT_ID` environment variable for OAuth verification.
+
+### Verify Email
 
 ```rust
 auth_service
@@ -147,7 +219,7 @@ auth_service
     .await?;
 ```
 
-#### Login
+### Login
 
 ```rust
 let LoginResult { account, tokens } = auth_service
@@ -158,7 +230,7 @@ let LoginResult { account, tokens } = auth_service
 // Store tokens.refresh_token in http-only cookie or secure storage on client
 ```
 
-#### Authenticate API request (access token)
+### Authenticate API Request (Access Token)
 
 ```rust
 let account = auth_service
@@ -168,7 +240,7 @@ let account = auth_service
 // account.id identifies the current user
 ```
 
-#### Refresh tokens
+### Refresh Tokens
 
 ```rust
 let RefreshResult { account, tokens } = auth_service
@@ -182,4 +254,76 @@ This will:
 - revoke the old refresh token
 - issue new access and refresh tokens
 
+## Configuration
 
+### Password Policy
+
+Customize password requirements:
+
+```rust
+let password_policy = PasswordPolicy {
+    min_length: 12,
+    require_uppercase: true,
+    require_lowercase: true,
+    require_digit: true,
+    require_special: true,
+    block_common_passwords: true,
+};
+```
+
+### Token Configuration
+
+Adjust token lifetimes:
+
+```rust
+let token_config = TokenConfig {
+    access_ttl: Duration::minutes(15),   // Short-lived access tokens
+    refresh_ttl: Duration::days(30),      // Longer-lived refresh tokens
+};
+```
+
+### Email Verification
+
+Configure verification code settings:
+
+```rust
+let email_verification_config = EmailVerificationConfig {
+    code_ttl: Duration::minutes(10),      // Code expiration time
+    code_length: 6,                        // Code length (numeric)
+};
+```
+
+## Distributed Deployments
+
+For multi-instance deployments, use `AuthService::with_locks()` to prevent race conditions:
+
+- **Token Refresh**: Prevents double-spending the same refresh token
+- **Email Verification**: Prevents using the same verification code twice
+- **Password Reset**: Prevents using the same reset code twice
+
+When using master-slave PostgreSQL:
+- Always use the master database connection for locks
+- Read replicas cannot acquire advisory locks
+- All lock operations must go through the master
+
+For single-instance deployments, locks are optional as PostgreSQL transactions already provide ACID guarantees.
+
+## Error Handling
+
+The library uses `IamError` for all error cases:
+
+```rust
+use nano_iam::IamError;
+
+match auth_service.login(email, password).await {
+    Ok(result) => { /* success */ }
+    Err(IamError::InvalidCredentials) => { /* wrong password */ }
+    Err(IamError::AccountNotFound) => { /* email not found */ }
+    Err(IamError::WeakPassword(msg)) => { /* password doesn't meet policy */ }
+    Err(e) => { /* other error */ }
+}
+```
+
+## License
+
+[Add your license here]

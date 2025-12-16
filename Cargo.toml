@@ -1,10 +1,10 @@
 [package]
-name = "iam"
+name = "nano-iam"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "iam"
+name = "nano_iam"
 path = "src/lib.rs"
 
 [dependencies]

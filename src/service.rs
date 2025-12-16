@@ -10,6 +10,7 @@ use tracing::{error, warn, info, debug};
 
 use crate::email::EmailSender;
 use crate::errors::IamError;
+use crate::locks::{LeaseLock, with_lock};
 use crate::models::{Account, AccountId, TokenPair, TokenType};
 use crate::repo::Repo;
 use crate::tokens::generate_token_pair;
@@ -61,6 +62,7 @@ pub struct AuthService {
     repo: Repo,
     email_sender: Arc<dyn EmailSender>,
     cfg: AuthConfig,
+    lock: Option<LeaseLock>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,33 @@ impl AuthService {
             repo,
             email_sender,
             cfg,
+            lock: None,
+        }
+    }
+
+    /// Create AuthService with lease locking enabled
+    /// 
+    /// # Parameters
+    /// - `repo`: Repository with database connection
+    /// - `email_sender`: Email sender implementation
+    /// - `cfg`: Authentication configuration
+    /// - `lock`: Lease lock manager (must use the same database pool as repo)
+    /// 
+    /// # Notes
+    /// - Locks are only needed for distributed deployments
+    /// - For single-instance deployments, you can use `new()` without locks
+    /// - When using master-slave setup, ensure lock uses the master database connection
+    pub fn with_locks(
+        repo: Repo,
+        email_sender: Arc<dyn EmailSender>,
+        cfg: AuthConfig,
+        lock: LeaseLock,
+    ) -> Self {
+        Self {
+            repo,
+            email_sender,
+            cfg,
+            lock: Some(lock),
         }
     }
 
@@ -232,6 +261,25 @@ impl AuthService {
         code: &str,
     ) -> Result<(), IamError> {
         debug!(account_id = %account_id, "Verifying email");
+        
+        // Critical section: Prevent using the same verification code twice
+        // Lock key: "verify_email:{account_id}:{code}"
+        let lock_key = format!("verify_email:{}:{}", account_id, code);
+        
+        if let Some(lock) = &self.lock {
+            with_lock(lock, &lock_key, 5, || async {
+                self.verify_email_internal(account_id, code).await
+            }).await
+        } else {
+            self.verify_email_internal(account_id, code).await
+        }
+    }
+
+    async fn verify_email_internal(
+        &self,
+        account_id: AccountId,
+        code: &str,
+    ) -> Result<(), IamError> {
         let now = self.now();
 
         self.repo
@@ -338,6 +386,26 @@ impl AuthService {
         refresh_token: &str,
     ) -> Result<RefreshResult, IamError> {
         debug!("Refreshing tokens");
+        
+        // Critical section: Prevent double-spending the same refresh token
+        // Lock key: "refresh_token:{token_value}"
+        let lock_key = format!("refresh_token:{}", refresh_token);
+        
+        if let Some(lock) = &self.lock {
+            with_lock(lock, &lock_key, 5, || async {
+                self.refresh_internal(refresh_token).await
+            }).await
+        } else {
+            // No locks configured, proceed without locking
+            // Note: In distributed setups, this could allow race conditions
+            self.refresh_internal(refresh_token).await
+        }
+    }
+
+    async fn refresh_internal(
+        &self,
+        refresh_token: &str,
+    ) -> Result<RefreshResult, IamError> {
         let now = self.now();
 
         let stored = self
@@ -627,6 +695,25 @@ impl AuthService {
                 IamError::AccountNotFound
             })?;
 
+        // Critical section: Prevent using the same reset code twice
+        // Lock key: "reset_password:{account_id}:{code}"
+        let lock_key = format!("reset_password:{}:{}", account.id, code);
+        
+        if let Some(lock) = &self.lock {
+            with_lock(lock, &lock_key, 5, || async {
+                self.reset_password_internal(&account, code, new_password).await
+            }).await
+        } else {
+            self.reset_password_internal(&account, code, new_password).await
+        }
+    }
+
+    async fn reset_password_internal(
+        &self,
+        account: &Account,
+        code: &str,
+        new_password: &str,
+    ) -> Result<(), IamError> {
         let now = self.now();
         self.repo
             .consume_email_verification(account.id, code, now)

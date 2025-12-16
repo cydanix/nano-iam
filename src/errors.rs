@@ -40,5 +40,8 @@ pub enum IamError {
 
     #[error("email already verified")]
     EmailAlreadyVerified,
+
+    #[error("lock acquisition timeout")]
+    LockTimeout,
 }
 

@@ -4,6 +4,7 @@ pub mod email;
 pub mod tokens;
 pub mod repo;
 pub mod service;
+pub mod locks;
 
 pub use crate::errors::IamError;
 pub use crate::service::{
@@ -16,4 +17,5 @@ pub use crate::service::{
     RefreshResult,
 };
 pub use crate::models::{Account, AccountId, Token};
+pub use crate::locks::LeaseLock;
 

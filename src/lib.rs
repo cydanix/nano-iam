@@ -5,6 +5,7 @@ pub mod tokens;
 pub mod repo;
 pub mod service;
 pub mod locks;
+pub mod retry;
 
 pub use crate::errors::IamError;
 pub use crate::service::{

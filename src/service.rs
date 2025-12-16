@@ -13,6 +13,7 @@ use crate::errors::IamError;
 use crate::locks::{LeaseLock, with_lock};
 use crate::models::{Account, AccountId, TokenPair, TokenType};
 use crate::repo::Repo;
+use crate::retry::retry;
 use crate::tokens::generate_token_pair;
 
 #[derive(Debug, Clone)]
@@ -212,26 +213,32 @@ impl AuthService {
         let now = self.now();
         let password_hash = self.hash_password(password)?;
 
-        let account = self
-            .repo
-            .create_account(email, &password_hash, now)
-            .await
-            .map_err(|e| {
-                error!(email = %email, error = %e, "Failed to create account");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        let account = retry(|| async {
+            self.repo
+                .create_account(email, &password_hash, now)
+                .await
+                .map_err(|e| {
+                    error!(email = %email, error = %e, "Failed to create account");
+                    e
+                })
+        })
+        .await?;
 
         let code =
             self.generate_verification_code(self.cfg.email_verification.code_length);
         let expires_at = now + self.cfg.email_verification.code_ttl;
 
-        self.repo
-            .create_email_verification(account.id, &code, expires_at, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account.id, error = %e, "Failed to create email verification");
-                e
-            })?;
+        retry(|| async {
+            self.repo
+                .create_email_verification(account.id, &code, expires_at, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account.id, error = %e, "Failed to create email verification");
+                    e
+                })
+        })
+        .await?;
 
         self.email_sender
             .send_verification_email(&account.email, &code, self.cfg.service_name.as_deref())
@@ -282,19 +289,28 @@ impl AuthService {
     ) -> Result<(), IamError> {
         let now = self.now();
 
-        self.repo
-            .consume_email_verification(account_id, code, now)
-            .await
-            .map_err(|e| {
-                warn!(account_id = %account_id, error = %e, "Email verification failed");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .consume_email_verification(account_id, code, now)
+                .await
+                .map_err(|e| {
+                    warn!(account_id = %account_id, error = %e, "Email verification failed");
+                    e
+                })
+        })
+        .await?;
 
-        self.repo.mark_email_verified(account_id, now).await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to mark email as verified");
-                e
-            })?;
+        retry(|| async {
+            self.repo
+                .mark_email_verified(account_id, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to mark email as verified");
+                    e
+                })
+        })
+        .await?;
 
         info!(account_id = %account_id, "Email verified successfully");
         Ok(())
@@ -350,33 +366,40 @@ impl AuthService {
             self.cfg.token.refresh_ttl,
         );
 
-        self.repo
-            .insert_token(
-                account_id,
-                pair.access_token.as_str(),
-                TokenType::Access,
-                pair.access_token_expires_at,
-                now,
-            )
-            .await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to insert access token");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .insert_token(
+                    account_id,
+                    pair.access_token.as_str(),
+                    TokenType::Access,
+                    pair.access_token_expires_at,
+                    now,
+                )
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to insert access token");
+                    e
+                })
+        })
+        .await?;
 
-        self.repo
-            .insert_token(
-                account_id,
-                pair.refresh_token.as_str(),
-                TokenType::Refresh,
-                pair.refresh_token_expires_at,
-                now,
-            )
-            .await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to insert refresh token");
-                e
-            })?;
+        retry(|| async {
+            self.repo
+                .insert_token(
+                    account_id,
+                    pair.refresh_token.as_str(),
+                    TokenType::Refresh,
+                    pair.refresh_token_expires_at,
+                    now,
+                )
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to insert refresh token");
+                    e
+                })
+        })
+        .await?;
 
         Ok(pair)
     }
@@ -408,22 +431,29 @@ impl AuthService {
     ) -> Result<RefreshResult, IamError> {
         let now = self.now();
 
-        let stored = self
-            .repo
-            .find_valid_token(refresh_token, TokenType::Refresh, now)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Token refresh failed: invalid or expired token");
-                e
-            })?;
+        // Retry read operations that may fail due to transient errors
+        let stored = retry(|| async {
+            self.repo
+                .find_valid_token(refresh_token, TokenType::Refresh, now)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "Token refresh failed: invalid or expired token");
+                    e
+                })
+        })
+        .await?;
 
-        self.repo
-            .revoke_token(refresh_token, TokenType::Refresh, now)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to revoke refresh token");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .revoke_token(refresh_token, TokenType::Refresh, now)
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to revoke refresh token");
+                    e
+                })
+        })
+        .await?;
 
         let account = self
             .repo
@@ -506,13 +536,17 @@ impl AuthService {
             return Err(IamError::InvalidCredentials);
         }
 
-        self.repo
-            .delete_account(account_id)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to delete account");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .delete_account(account_id)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to delete account");
+                    e
+                })
+        })
+        .await?;
 
         info!(account_id = %account_id, "Account deleted successfully");
         Ok(())
@@ -525,13 +559,17 @@ impl AuthService {
         debug!("Logging out");
         let now = self.now();
 
-        self.repo
-            .revoke_token(access_token, TokenType::Access, now)
-            .await
-            .map_err(|e| {
-                warn!(error = %e, "Failed to revoke access token during logout");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .revoke_token(access_token, TokenType::Access, now)
+                .await
+                .map_err(|e| {
+                    warn!(error = %e, "Failed to revoke access token during logout");
+                    e
+                })
+        })
+        .await?;
 
         info!("Logout successful");
         Ok(())
@@ -563,13 +601,17 @@ impl AuthService {
         }
 
         let now = self.now();
-        self.repo
-            .revoke_all_tokens(account_id, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to revoke all tokens");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .revoke_all_tokens(account_id, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to revoke all tokens");
+                    e
+                })
+        })
+        .await?;
 
         info!(account_id = %account_id, "All sessions logged out successfully");
         Ok(())
@@ -606,22 +648,29 @@ impl AuthService {
         let now = self.now();
         let new_password_hash = self.hash_password(new_password)?;
 
-        self.repo
-            .update_password_hash(account_id, &new_password_hash, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to update password");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .update_password_hash(account_id, &new_password_hash, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to update password");
+                    e
+                })
+        })
+        .await?;
 
         // Revoke all existing tokens after password change for security
-        self.repo
-            .revoke_all_tokens(account_id, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account_id, error = %e, "Failed to revoke tokens after password change");
-                e
-            })?;
+        retry(|| async {
+            self.repo
+                .revoke_all_tokens(account_id, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to revoke tokens after password change");
+                    e
+                })
+        })
+        .await?;
 
         info!(account_id = %account_id, "Password changed successfully");
         Ok(())
@@ -654,13 +703,17 @@ impl AuthService {
         // Invalidate any existing password reset codes
         // (We could add a method to delete old codes, but creating a new one works)
         
-        self.repo
-            .create_email_verification(account.id, &code, expires_at, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account.id, error = %e, "Failed to create password reset code");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .create_email_verification(account.id, &code, expires_at, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account.id, error = %e, "Failed to create password reset code");
+                    e
+                })
+        })
+        .await?;
 
         self.email_sender
             .send_password_reset_email(&account.email, &code, self.cfg.service_name.as_deref())
@@ -715,33 +768,43 @@ impl AuthService {
         new_password: &str,
     ) -> Result<(), IamError> {
         let now = self.now();
-        self.repo
-            .consume_email_verification(account.id, code, now)
-            .await
-            .map_err(|e| {
-                warn!(account_id = %account.id, error = %e, "Password reset code validation failed");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .consume_email_verification(account.id, code, now)
+                .await
+                .map_err(|e| {
+                    warn!(account_id = %account.id, error = %e, "Password reset code validation failed");
+                    e
+                })
+        })
+        .await?;
 
         self.validate_password_complexity(new_password)?;
 
         let new_password_hash = self.hash_password(new_password)?;
-        self.repo
-            .update_password_hash(account.id, &new_password_hash, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account.id, error = %e, "Failed to update password");
-                e
-            })?;
+        retry(|| async {
+            self.repo
+                .update_password_hash(account.id, &new_password_hash, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account.id, error = %e, "Failed to update password");
+                    e
+                })
+        })
+        .await?;
 
         // Revoke all existing tokens after password reset for security
-        self.repo
-            .revoke_all_tokens(account.id, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account.id, error = %e, "Failed to revoke tokens after password reset");
-                e
-            })?;
+        retry(|| async {
+            self.repo
+                .revoke_all_tokens(account.id, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account.id, error = %e, "Failed to revoke tokens after password reset");
+                    e
+                })
+        })
+        .await?;
 
         info!(account_id = %account.id, email = %account.email, "Password reset successfully");
         Ok(())
@@ -775,13 +838,17 @@ impl AuthService {
         let code = self.generate_verification_code(self.cfg.email_verification.code_length);
         let expires_at = now + self.cfg.email_verification.code_ttl;
 
-        self.repo
-            .create_email_verification(account.id, &code, expires_at, now)
-            .await
-            .map_err(|e| {
-                error!(account_id = %account.id, error = %e, "Failed to create email verification");
-                e
-            })?;
+        // Retry database operations that may fail due to transient errors
+        retry(|| async {
+            self.repo
+                .create_email_verification(account.id, &code, expires_at, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account.id, error = %e, "Failed to create email verification");
+                    e
+                })
+        })
+        .await?;
 
         self.email_sender
             .send_verification_email(&account.email, &code, self.cfg.service_name.as_deref())

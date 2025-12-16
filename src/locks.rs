@@ -103,20 +103,43 @@ impl LeaseLock {
             }
             Ok(result)
         } else {
-            // Acquire lock with timeout
-            let result = sqlx::query_scalar::<_, bool>(
-                "select pg_advisory_lock($1)",
-            )
-            .bind(lock_id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| {
-                error!(key = %key, lock_id = lock_id, error = %e, "Failed to acquire advisory lock with timeout");
-                IamError::Db(e)
-            })?;
+            // Acquire lock with timeout using retry loop
+            // pg_try_advisory_lock_timeout may not be available in all PostgreSQL versions
+            // So we use pg_try_advisory_lock in a retry loop with exponential backoff
+            use tokio::time::{sleep, Duration, Instant};
+            
+            let start = Instant::now();
+            let timeout = Duration::from_secs(timeout_secs);
+            let mut retry_delay = Duration::from_millis(50);
+            let max_retry_delay = Duration::from_millis(500);
+            
+            loop {
+                let acquired = sqlx::query_scalar::<_, bool>(
+                    "select pg_try_advisory_lock($1)",
+                )
+                .bind(lock_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    error!(key = %key, lock_id = lock_id, error = %e, "Failed to try acquire advisory lock");
+                    IamError::Db(e)
+                })?;
 
-            debug!(key = %key, lock_id = lock_id, "Lease lock acquired with timeout");
-            Ok(result)
+                if acquired {
+                    debug!(key = %key, lock_id = lock_id, "Lease lock acquired with timeout");
+                    return Ok(true);
+                }
+
+                // Check if we've exceeded the timeout
+                if start.elapsed() >= timeout {
+                    debug!(key = %key, lock_id = lock_id, "Failed to acquire lock within timeout");
+                    return Ok(false);
+                }
+
+                // Wait before retrying
+                sleep(retry_delay).await;
+                retry_delay = (retry_delay * 2).min(max_retry_delay);
+            }
         }
     }
 

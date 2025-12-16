@@ -19,4 +19,5 @@ pub use crate::service::{
 };
 pub use crate::models::{Account, AccountId, Token};
 pub use crate::locks::LeaseLock;
+pub use crate::repo::Repo;
 

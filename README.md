@@ -8,9 +8,30 @@ This crate provides basic email+password authentication with:
 
 ### Database schema (SQLx)
 
-You can create the minimal schema with:
+You can create the minimal schema programmatically using the `Repo::create_schema()` method:
+
+```rust
+use iam::repo::Repo;
+use sqlx::postgres::PgPoolOptions;
+
+async fn setup_database(database_url: &str) -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await?;
+    
+    let repo = Repo::new(pool);
+    repo.create_schema().await?;
+    
+    Ok(())
+}
+```
+
+Alternatively, you can create the schema manually with SQL:
 
 ```sql
+create type token_type as enum ('access', 'refresh');
+
 create table accounts (
     id uuid primary key,
     email text not null unique,
@@ -19,8 +40,6 @@ create table accounts (
     created_at timestamptz not null,
     updated_at timestamptz not null
 );
-
-create type token_type as enum ('access', 'refresh');
 
 create table tokens (
     id uuid primary key,
@@ -41,6 +60,8 @@ create table email_verifications (
     created_at timestamptz not null
 );
 ```
+
+**Note:** The `create_schema()` method is idempotent and can be called multiple times safely.
 
 ### Public API
 

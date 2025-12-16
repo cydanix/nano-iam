@@ -536,13 +536,14 @@ impl AuthService {
             return Err(IamError::InvalidCredentials);
         }
 
+        let now = self.now();
         // Retry database operations that may fail due to transient errors
         retry(|| async {
             self.repo
-                .delete_account(account_id)
+                .delete_account(account_id, now)
                 .await
                 .map_err(|e| {
-                    error!(account_id = %account_id, error = %e, "Failed to delete account");
+                    error!(account_id = %account_id, error = %e, "Failed to soft-delete account");
                     e
                 })
         })
@@ -896,6 +897,45 @@ impl AuthService {
             })?;
 
         Ok(account)
+    }
+
+    /// Cleanup expired and consumed objects from the database
+    /// 
+    /// This method should be called periodically (e.g., via a cron job or scheduled task)
+    /// to remove expired tokens, email verifications, and permanently delete accounts
+    /// that have been soft-deleted for longer than the retention period.
+    /// 
+    /// Deletes:
+    /// - Expired tokens (where `expires_at < now`)
+    /// - Revoked tokens (where `revoked_at is not null`)
+    /// - Expired email verifications (where `expires_at < now`)
+    /// - Consumed email verifications (where `consumed_at is not null`)
+    /// - Soft-deleted accounts (where `deleted_at < now - account_retention_days`)
+    /// 
+    /// # Parameters
+    /// - `account_retention_days`: Number of days to retain soft-deleted accounts before permanent deletion (e.g., 30)
+    /// 
+    /// # Returns
+    /// A tuple containing the number of deleted tokens, email verifications, and accounts
+    /// 
+    /// # Example
+    /// ```rust,no_run
+    /// use iam::AuthService;
+    /// 
+    /// # async fn example(auth: AuthService) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Cleanup with 30-day retention for soft-deleted accounts
+    /// let (tokens, verifications, accounts) = auth.cleanup_expired_objects(30).await?;
+    /// println!("Deleted {} tokens, {} verifications, and {} accounts", tokens, verifications, accounts);
+    /// # Ok(())
+    /// # }
+    /// ```
+    /// 
+    /// # Errors
+    /// Returns `IamError::Db` if there's a database error during cleanup
+    pub async fn cleanup_expired_objects(&self, account_retention_days: i64) -> Result<(u64, u64, u64), IamError> {
+        info!(account_retention_days = account_retention_days, "Starting cleanup of expired and consumed objects");
+        let now = self.now();
+        self.repo.cleanup_expired_objects(now, account_retention_days).await
     }
 }
 

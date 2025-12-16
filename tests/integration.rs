@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use chrono::Duration;
 use iam::{
@@ -15,6 +15,30 @@ use sqlx::Pool;
 use sqlx::Postgres;
 
 type PgPool = Pool<Postgres>;
+
+// Initialize tracing subscriber once for all tests
+// This allows RUST_LOG environment variable to control log levels
+// 
+// Usage:
+//   RUST_LOG=debug cargo test -- --nocapture
+//   RUST_LOG=trace cargo test --test integration -- --nocapture
+//   RUST_LOG=iam::service=debug cargo test -- --nocapture
+static INIT_TRACING: Once = Once::new();
+
+fn init_tracing() {
+    INIT_TRACING.call_once(|| {
+        // Initialize tracing subscriber that respects RUST_LOG environment variable
+        // Write to stderr so logs are visible (use --nocapture to see them in test output)
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+        
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .with_ansi(true)
+            .init();
+    });
+}
 
 struct TestEmailSender {
     last: Arc<Mutex<Option<(String, String)>>>,
@@ -70,77 +94,28 @@ async fn setup_db() -> Result<PgPool, Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
 
-    // Minimal schema for tests; matches README.md
-    // Drop and recreate all objects for clean test isolation
-    // Use a single DO block to handle everything atomically and handle race conditions
+    // Drop existing tables for clean test isolation
+    // This ensures each test starts with a fresh schema
+    // Use a DO block to execute multiple statements in a single query
     sqlx::query(
         r#"
-do $$
-begin
-    -- Drop tables first (they depend on the enum type)
-    drop table if exists email_verifications cascade;
-    drop table if exists tokens cascade;
-    drop table if exists accounts cascade;
-    
-    -- Drop enum type if it exists (CASCADE will drop dependent objects)
-    drop type if exists token_type cascade;
-    
-    -- Create enum type (handle race condition where another test already created it)
-    -- Check if type exists first to avoid errors
-    if not exists (
-        select 1 from pg_type 
-        where typname = 'token_type' 
-        and typtype = 'e'
-    ) then
+        do $$
         begin
-            create type token_type as enum ('access', 'refresh');
-        exception
-            when duplicate_object then
-                null; -- Type already exists, that's fine
-            when others then
-                -- Check if it's a constraint violation (type already exists)
-                if sqlstate = '23505' or sqlstate = '42710' then
-                    null;
-                else
-                    raise;
-                end if;
-        end;
-    end if;
-    
-    -- Create tables (use IF NOT EXISTS to handle race conditions)
-    create table if not exists accounts (
-        id uuid primary key,
-        email text not null unique,
-        password_hash text not null,
-        email_verified boolean not null default false,
-        created_at timestamptz not null,
-        updated_at timestamptz not null
-    );
-    
-    create table if not exists tokens (
-        id uuid primary key,
-        account_id uuid not null references accounts(id) on delete cascade,
-        token text not null unique,
-        token_type token_type not null,
-        expires_at timestamptz not null,
-        created_at timestamptz not null,
-        revoked_at timestamptz
-    );
-    
-    create table if not exists email_verifications (
-        id uuid primary key,
-        account_id uuid not null references accounts(id) on delete cascade,
-        code text not null,
-        expires_at timestamptz not null,
-        consumed_at timestamptz,
-        created_at timestamptz not null
-    );
-end
-$$;
+            drop table if exists email_verifications cascade;
+            drop table if exists tokens cascade;
+            drop table if exists accounts cascade;
+            drop type if exists token_type cascade;
+        end
+        $$;
         "#,
     )
     .execute(&pool)
     .await?;
+
+    // Use the Repo's create_schema method to create the schema
+    // This method includes locks and retries for safe concurrent execution
+    let repo = iam::Repo::new(pool.clone());
+    repo.create_schema().await?;
 
     Ok(pool)
 }
@@ -204,6 +179,7 @@ async fn setup_auth_service_with_ttls(
 #[tokio::test]
 async fn full_auth_flow_register_verify_login_refresh(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     let email = "test@example.com";
@@ -259,6 +235,7 @@ async fn full_auth_flow_register_verify_login_refresh(
 #[tokio::test]
 async fn test_expired_access_token_fails_authentication(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     // Use very short TTL for access token
     let (auth, sent_codes) = setup_auth_service_with_ttls(
         Duration::seconds(1),
@@ -308,6 +285,7 @@ async fn test_expired_access_token_fails_authentication(
 #[tokio::test]
 async fn test_expired_refresh_token_fails_refresh(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     // Use very short TTL for refresh token
     let (auth, sent_codes) = setup_auth_service_with_ttls(
         Duration::minutes(15),
@@ -357,6 +335,7 @@ async fn test_expired_refresh_token_fails_refresh(
 #[tokio::test]
 async fn test_refresh_token_revoked_after_use(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     let email = "revoked@example.com";
@@ -402,6 +381,7 @@ async fn test_refresh_token_revoked_after_use(
 #[tokio::test]
 async fn test_refresh_issues_new_tokens(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     let email = "newtokens@example.com";
@@ -447,6 +427,7 @@ async fn test_refresh_issues_new_tokens(
 #[tokio::test]
 async fn test_multiple_refreshes_work(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     let email = "multirefresh@example.com";
@@ -497,6 +478,7 @@ async fn test_multiple_refreshes_work(
 #[tokio::test]
 async fn test_access_token_works_after_refresh(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     let email = "accessafterrefresh@example.com";
@@ -541,6 +523,7 @@ async fn test_access_token_works_after_refresh(
 #[tokio::test]
 async fn test_email_sent_on_registration(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     let email = "emailtest@example.com";
@@ -573,6 +556,7 @@ async fn test_email_sent_on_registration(
 #[tokio::test]
 async fn test_email_sent_for_each_registration(
 ) -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let (auth, sent_codes) = setup_auth_service().await?;
 
     // Register first account

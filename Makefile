@@ -7,7 +7,7 @@ testsdb:
 
 tests: testsdb
 	export TEST_DATABASE_URL=postgresql://postgres:mysecretpassword@127.0.0.1:5432/postgres
-	cargo test
+	RUST_LOG=debug cargo test -- --nocapture
 
 clean:
 	cargo clean

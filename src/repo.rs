@@ -69,6 +69,28 @@ where email = $1
         Ok(rec)
     }
 
+    pub async fn find_account_by_email_including_deleted(
+        &self,
+        email: &str,
+    ) -> Result<Option<Account>, IamError> {
+        let rec = sqlx::query_as::<_, Account>(
+            r#"
+select id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+from accounts
+where email = $1
+            "#,
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(email = %email, error = %e, "Database error finding account by email (including deleted)");
+            IamError::from(e)
+        })?;
+
+        Ok(rec)
+    }
+
     pub async fn find_account_by_id(
         &self,
         account_id: AccountId,
@@ -86,6 +108,28 @@ where id = $1
         .await
         .map_err(|e| {
             error!(account_id = %account_id, error = %e, "Database error finding account by id");
+            IamError::from(e)
+        })?;
+
+        Ok(rec)
+    }
+
+    pub async fn find_account_by_id_including_deleted(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<Account>, IamError> {
+        let rec = sqlx::query_as::<_, Account>(
+            r#"
+select id, email, password_hash, email_verified, created_at, updated_at, deleted_at
+from accounts
+where id = $1
+            "#,
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(account_id = %account_id, error = %e, "Database error finding account by id (including deleted)");
             IamError::from(e)
         })?;
 
@@ -516,7 +560,7 @@ limit 1
 
     /// Verify that the schema already exists
     /// Returns Ok(()) if all required tables and types exist
-    async fn verify_schema_exists(&self) -> Result<(), IamError> {
+    pub async fn verify_schema_exists(&self) -> Result<(), IamError> {
         debug!("Verifying schema existence");
         
         // Check if token_type enum exists
@@ -633,7 +677,7 @@ limit 1
                 r#"
                 delete from accounts
                 where deleted_at is not null
-                  and deleted_at < $1
+                  and deleted_at <= $1
                 "#,
             )
             .bind(retention_threshold)

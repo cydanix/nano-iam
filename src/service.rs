@@ -496,7 +496,7 @@ impl AuthService {
 
         let account = self
             .repo
-            .find_account_by_id(stored.account_id)
+            .find_account_by_id_including_deleted(stored.account_id)
             .await
             .map_err(|e| {
                 error!(account_id = %stored.account_id, error = %e, "Database error finding account");
@@ -869,7 +869,7 @@ impl AuthService {
     ) -> Result<bool, IamError> {
         let account = self
             .repo
-            .find_account_by_email(email)
+            .find_account_by_email_including_deleted(email)
             .await
             .map_err(|e| {
                 error!(email = %email, error = %e, "Database error checking email availability");

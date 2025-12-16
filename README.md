@@ -326,4 +326,4 @@ match auth_service.login(email, password).await {
 
 ## License
 
-[Add your license here]
+MIT

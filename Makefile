@@ -1,14 +1,13 @@
-.PHONY: testsdb test clean
+.PHONY: testsdb tests clean
 
 testsdb:
-	docker rm -f iam-postgres
-	docker run --name iam-postgres -e POSTGRES_PASSWORD=mysecretpassword -p 127.0.0.1:5432:5432 -d postgres
-	sleep 3
+	docker rm -f nano-iam-postgres
+	docker run --name nano-iam-postgres -e POSTGRES_PASSWORD=mysecretpassword -p 127.0.0.1:5432:5432 -d postgres
+	sleep 10
 
 tests: testsdb
-	export TEST_DATABASE_URL=postgresql://postgres:mysecretpassword@127.0.0.1:5432/postgres
-	RUST_LOG=error cargo test -- --test-threads=1 --nocapture
+	TEST_DATABASE_URL=postgresql://postgres:mysecretpassword@127.0.0.1:5432/postgres RUST_LOG=error cargo test -- --test-threads=1 --nocapture
 
 clean:
 	cargo clean
-	docker rm -f iam-postgres || true
+	docker rm -f nano-iam-postgres || true

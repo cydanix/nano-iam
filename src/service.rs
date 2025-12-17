@@ -378,19 +378,19 @@ impl AuthService {
             Some(acc) => acc,
             None => {
                 if auth_type == AuthType::Google {
-                    // Auto-create account for Google OAuth (email is already verified by Google)
-                    info!(email = %email, "Auto-creating account for Google OAuth");
-                    let now = self.now();
-                    retry(|| async {
-                        self.repo
-                            .create_account(&email, "", AuthType::Google, now)
-                            .await
-                            .map_err(|e| {
-                                error!(email = %email, error = %e, "Failed to create Google OAuth account");
-                                e
-                            })
-                    })
-                    .await?
+                    // Lock to prevent race condition when multiple requests try to create same account
+                    // Lock key: "create_google_account:{email}"
+                    let lock_key = format!("create_google_account:{}", email);
+                    
+                    if let Some(lock) = &self.lock {
+                        with_lock(lock, &lock_key, 5, || async {
+                            self.create_or_get_google_account(&email).await
+                        }).await?
+                    } else {
+                        // No locks configured, proceed without locking
+                        // Note: In distributed setups, this could allow race conditions
+                        self.create_or_get_google_account(&email).await?
+                    }
                 } else {
                     warn!(email = %email, "Login failed: account not found");
                     return Err(IamError::InvalidCredentials);
@@ -431,6 +431,31 @@ impl AuthService {
 
         info!(account_id = %account.id, email = %email, "Login successful");
         Ok(LoginResult { account, tokens })
+    }
+
+    async fn create_or_get_google_account(&self, email: &str) -> Result<Account, IamError> {
+        // Check again if account exists (might have been created by another request while waiting for lock)
+        if let Some(account) = self.repo.find_account_by_email(email).await.map_err(|e| {
+            error!(email = %email, error = %e, "Database error checking for existing account");
+            e
+        })? {
+            info!(email = %email, account_id = %account.id, "Account already exists, using existing account");
+            return Ok(account);
+        }
+        
+        // Create account
+        info!(email = %email, "Auto-creating account for Google OAuth");
+        let now = self.now();
+        retry(|| async {
+            self.repo
+                .create_account(email, "", AuthType::Google, now)
+                .await
+                .map_err(|e| {
+                    error!(email = %email, error = %e, "Failed to create Google OAuth account");
+                    e
+                })
+        })
+        .await
     }
 
     async fn issue_tokens_for_account(

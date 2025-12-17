@@ -5,9 +5,9 @@ use crate::errors::IamError;
 
 /// Lease lock manager using PostgreSQL advisory locks
 /// 
-/// # When to Use Locks
+/// # Purpose
 /// 
-/// Locks are needed for distributed deployments to prevent race conditions:
+/// Locks are required for distributed PostgreSQL deployments to prevent race conditions:
 /// 
 /// 1. **Token Refresh** - Prevents double-spending the same refresh token
 ///    - Without lock: Two concurrent requests could both use the same refresh token
@@ -21,26 +21,25 @@ use crate::errors::IamError;
 ///    - Without lock: Two concurrent requests could both reset with the same code
 ///    - With lock: Only one request can consume a reset code
 /// 
+/// 4. **Google OAuth Account Creation** - Prevents duplicate account creation
+///    - Without lock: Two concurrent OAuth logins could try to create the same account
+///    - With lock: Only one request creates the account, the other reuses it
+/// 
+/// 5. **Change Password** - Prevents password change race conditions
+///    - Without lock: Two concurrent password changes could cause inconsistent state
+///    - With lock: Only one password change can happen at a time per account
+/// 
+/// 6. **Cleanup Expired Objects** - Prevents multiple cleanup jobs running simultaneously
+///    - Without lock: Multiple cleanup jobs waste resources
+///    - With lock: Only one cleanup job runs at a time
+/// 
 /// # Master-Slave Setup
 /// 
 /// When using a master-slave PostgreSQL setup:
 /// - **Always use the master database connection for locks**
 /// - Read replicas cannot acquire advisory locks
 /// - All lock operations must go through the master
-/// 
-/// # Single Instance
-/// 
-/// For single-instance deployments, locks are optional:
-/// - PostgreSQL transactions already provide ACID guarantees
-/// - Locks add overhead without benefit
-/// - Use `AuthService::new()` without locks
-/// 
-/// # Distributed Deployments
-/// 
-/// For distributed deployments (multiple app instances):
-/// - **Always use locks** to prevent race conditions
-/// - Use `AuthService::with_locks()` to enable locking
-/// - Ensure all instances connect to the same master database
+/// - Use the same database pool for both `Repo` and `LeaseLock`
 
 pub type PgPool = Pool<Postgres>;
 

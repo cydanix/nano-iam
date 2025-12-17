@@ -26,9 +26,9 @@ A lightweight, production-ready Rust library for Identity and Access Management 
   - Support for master-slave database setups
 
 - **Distributed System Support**
-  - Optional PostgreSQL advisory locks for distributed deployments
-  - Prevents race conditions in token refresh and email verification
-  - Safe for single-instance deployments without locks
+  - PostgreSQL advisory locks for distributed deployments
+  - Prevents race conditions in token refresh, email verification, and password reset
+  - Supports master-slave PostgreSQL setups
 
 - **Production Ready**
   - Automatic retry logic for transient database errors
@@ -145,7 +145,10 @@ async fn build_auth_service(database_url: &str) -> anyhow::Result<AuthService> {
         .connect(database_url)
         .await?;
 
-    let repo = Repo::new(pool);
+    let repo = Repo::new(pool.clone());
+    
+    // Create lock for distributed deployment (required)
+    let lock = nano_iam::locks::LeaseLock::new(pool);
 
     let transport = AsyncSmtpTransport::<Tokio1Executor>::relay("smtp.example.com")?
         .build();
@@ -166,18 +169,11 @@ async fn build_auth_service(database_url: &str) -> anyhow::Result<AuthService> {
         service_name: None, // Optional service name for email templates
     };
 
-    Ok(AuthService::new(repo, email_sender, cfg))
+    Ok(AuthService::new(repo, email_sender, cfg, lock))
 }
 ```
 
-For distributed deployments, use `AuthService::with_locks()` to enable distributed locking:
-
-```rust
-use nano_iam::locks::LeaseLock;
-
-let lock = LeaseLock::new(pool.clone()); // Must use same pool as repo
-let auth_service = AuthService::with_locks(repo, email_sender, cfg, lock);
-```
+**Note:** Locks are required for distributed PostgreSQL deployments to prevent race conditions in critical operations like token refresh, email verification, and password reset.
 
 ## Typical Flows
 
@@ -295,18 +291,22 @@ let email_verification_config = EmailVerificationConfig {
 
 ## Distributed Deployments
 
-For multi-instance deployments, use `AuthService::with_locks()` to prevent race conditions:
+This library is designed for distributed PostgreSQL deployments and uses advisory locks to prevent race conditions:
 
 - **Token Refresh**: Prevents double-spending the same refresh token
 - **Email Verification**: Prevents using the same verification code twice
 - **Password Reset**: Prevents using the same reset code twice
+- **Google OAuth Account Creation**: Prevents duplicate account creation
+- **Change Password**: Prevents concurrent password changes causing inconsistent state
+- **Cleanup Expired Objects**: Prevents multiple cleanup jobs running simultaneously
+
+### Master-Slave PostgreSQL Setup
 
 When using master-slave PostgreSQL:
-- Always use the master database connection for locks
+- **Always use the master database connection for locks**
 - Read replicas cannot acquire advisory locks
 - All lock operations must go through the master
-
-For single-instance deployments, locks are optional as PostgreSQL transactions already provide ACID guarantees.
+- Use the same database pool for both `Repo` and `LeaseLock`
 
 ## Error Handling
 

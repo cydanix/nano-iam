@@ -140,7 +140,8 @@ async fn setup_auth_service(
 ) -> Result<(AuthService, Arc<Mutex<Option<(String, String)>>>), Box<dyn std::error::Error>>
 {
     let pool = setup_db().await?;
-    let repo = Repo::new(pool);
+    let repo = Repo::new(pool.clone());
+    let lock = LeaseLock::new(pool);
 
     let (sender, shared) = TestEmailSender::new();
     let email_sender = Arc::new(sender);
@@ -158,7 +159,7 @@ async fn setup_auth_service(
         service_name: None,
     };
 
-    let service = AuthService::new(repo, email_sender, cfg);
+    let service = AuthService::new(repo, email_sender, cfg, lock);
 
     Ok((service, shared))
 }
@@ -169,7 +170,8 @@ async fn setup_auth_service_with_ttls(
 ) -> Result<(AuthService, Arc<Mutex<Option<(String, String)>>>), Box<dyn std::error::Error>>
 {
     let pool = setup_db().await?;
-    let repo = Repo::new(pool);
+    let repo = Repo::new(pool.clone());
+    let lock = LeaseLock::new(pool);
 
     let (sender, shared) = TestEmailSender::new();
     let email_sender = Arc::new(sender);
@@ -187,7 +189,7 @@ async fn setup_auth_service_with_ttls(
         service_name: None,
     };
 
-    let service = AuthService::new(repo, email_sender, cfg);
+    let service = AuthService::new(repo, email_sender, cfg, lock);
 
     Ok((service, shared))
 }
@@ -197,6 +199,7 @@ async fn setup_auth_service_with_pool(
 {
     let pool = setup_db().await?;
     let repo = Repo::new(pool.clone());
+    let lock = LeaseLock::new(pool.clone());
 
     let (sender, shared) = TestEmailSender::new();
     let email_sender = Arc::new(sender);
@@ -214,7 +217,7 @@ async fn setup_auth_service_with_pool(
         service_name: None,
     };
 
-    let service = AuthService::new(repo, email_sender, cfg);
+    let service = AuthService::new(repo, email_sender, cfg, lock);
 
     Ok((service, shared, pool))
 }

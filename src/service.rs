@@ -64,7 +64,7 @@ pub struct AuthService {
     repo: Repo,
     email_sender: Arc<dyn EmailSender>,
     cfg: AuthConfig,
-    lock: Option<LeaseLock>,
+    lock: LeaseLock,
 }
 
 #[derive(Debug, Clone)]
@@ -80,16 +80,7 @@ pub struct RefreshResult {
 }
 
 impl AuthService {
-    pub fn new(repo: Repo, email_sender: Arc<dyn EmailSender>, cfg: AuthConfig) -> Self {
-        Self {
-            repo,
-            email_sender,
-            cfg,
-            lock: None,
-        }
-    }
-
-    /// Create AuthService with lease locking enabled
+    /// Create AuthService for distributed PostgreSQL deployments
     /// 
     /// # Parameters
     /// - `repo`: Repository with database connection
@@ -98,10 +89,10 @@ impl AuthService {
     /// - `lock`: Lease lock manager (must use the same database pool as repo)
     /// 
     /// # Notes
-    /// - Locks are only needed for distributed deployments
-    /// - For single-instance deployments, you can use `new()` without locks
+    /// - Locks are required to prevent race conditions in distributed deployments
     /// - When using master-slave setup, ensure lock uses the master database connection
-    pub fn with_locks(
+    /// - All critical operations (token refresh, email verification, password reset) use locks
+    pub fn new(
         repo: Repo,
         email_sender: Arc<dyn EmailSender>,
         cfg: AuthConfig,
@@ -111,7 +102,7 @@ impl AuthService {
             repo,
             email_sender,
             cfg,
-            lock: Some(lock),
+            lock,
         }
     }
 
@@ -295,13 +286,9 @@ impl AuthService {
         // Lock key: "verify_email:{account_id}:{code}"
         let lock_key = format!("verify_email:{}:{}", account_id, code);
         
-        if let Some(lock) = &self.lock {
-            with_lock(lock, &lock_key, 5, || async {
-                self.verify_email_internal(account_id, code).await
-            }).await
-        } else {
+        with_lock(&self.lock, &lock_key, 5, || async {
             self.verify_email_internal(account_id, code).await
-        }
+        }).await
     }
 
     async fn verify_email_internal(
@@ -382,15 +369,9 @@ impl AuthService {
                     // Lock key: "create_google_account:{email}"
                     let lock_key = format!("create_google_account:{}", email);
                     
-                    if let Some(lock) = &self.lock {
-                        with_lock(lock, &lock_key, 5, || async {
-                            self.create_or_get_google_account(&email).await
-                        }).await?
-                    } else {
-                        // No locks configured, proceed without locking
-                        // Note: In distributed setups, this could allow race conditions
-                        self.create_or_get_google_account(&email).await?
-                    }
+                    with_lock(&self.lock, &lock_key, 5, || async {
+                        self.create_or_get_google_account(&email).await
+                    }).await?
                 } else {
                     warn!(email = %email, "Login failed: account not found");
                     return Err(IamError::InvalidCredentials);
@@ -535,15 +516,9 @@ impl AuthService {
         // Lock key: "refresh_token:{token_value}"
         let lock_key = format!("refresh_token:{}", refresh_token);
         
-        if let Some(lock) = &self.lock {
-            with_lock(lock, &lock_key, 5, || async {
-                self.refresh_internal(refresh_token).await
-            }).await
-        } else {
-            // No locks configured, proceed without locking
-            // Note: In distributed setups, this could allow race conditions
+        with_lock(&self.lock, &lock_key, 5, || async {
             self.refresh_internal(refresh_token).await
-        }
+        }).await
     }
 
     async fn refresh_internal(
@@ -798,6 +773,21 @@ impl AuthService {
     ) -> Result<(), IamError> {
         info!(account_id = %account_id, "Changing password");
         
+        // Critical section: Prevent race condition when multiple password changes happen concurrently
+        // Lock key: "change_password:{account_id}"
+        let lock_key = format!("change_password:{}", account_id);
+        
+        with_lock(&self.lock, &lock_key, 5, || async {
+            self.change_password_internal(account_id, old_password, new_password).await
+        }).await
+    }
+
+    async fn change_password_internal(
+        &self,
+        account_id: AccountId,
+        old_password: &str,
+        new_password: &str,
+    ) -> Result<(), IamError> {
         let account = self
             .repo
             .find_account_by_id(account_id)
@@ -925,13 +915,9 @@ impl AuthService {
         // Lock key: "reset_password:{account_id}:{code}"
         let lock_key = format!("reset_password:{}:{}", account.id, code);
         
-        if let Some(lock) = &self.lock {
-            with_lock(lock, &lock_key, 5, || async {
-                self.reset_password_internal(&account, code, new_password).await
-            }).await
-        } else {
+        with_lock(&self.lock, &lock_key, 5, || async {
             self.reset_password_internal(&account, code, new_password).await
-        }
+        }).await
     }
 
     async fn reset_password_internal(
@@ -1106,8 +1092,15 @@ impl AuthService {
     /// Returns `IamError::Db` if there's a database error during cleanup
     pub async fn cleanup_expired_objects(&self, account_retention_days: i64) -> Result<(u64, u64, u64), IamError> {
         info!(account_retention_days = account_retention_days, "Starting cleanup of expired and consumed objects");
-        let now = self.now();
-        self.repo.cleanup_expired_objects(now, account_retention_days).await
+        
+        // Lock to prevent multiple cleanup jobs from running simultaneously
+        // This prevents resource waste and potential conflicts
+        let lock_key = "cleanup_expired_objects";
+        
+        with_lock(&self.lock, &lock_key, 60, || async {  // Longer timeout for cleanup operations
+            let now = self.now();
+            self.repo.cleanup_expired_objects(now, account_retention_days).await
+        }).await
     }
 }
 

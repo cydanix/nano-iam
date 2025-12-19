@@ -49,7 +49,9 @@ nano-iam = { path = "../nano-iam" }
 
 ## Database Schema
 
-You can create the minimal schema programmatically using the `Repo::create_schema()` method:
+### Using Migrations (Recommended)
+
+The recommended way to set up the database schema is using SQLx migrations:
 
 ```rust
 use nano_iam::repo::Repo;
@@ -62,11 +64,15 @@ async fn setup_database(database_url: &str) -> anyhow::Result<()> {
         .await?;
     
     let repo = Repo::new(pool);
-    repo.create_schema().await?;
+    repo.migrate().await?;
     
     Ok(())
 }
 ```
+
+Migrations are located in the `src/migrations/` directory and are automatically applied when you call `migrate()`. The migration system uses PostgreSQL advisory locks to ensure only one instance runs migrations at a time.
+
+### Manual Schema Creation (Deprecated)
 
 Alternatively, you can create the schema manually with SQL:
 
@@ -106,7 +112,7 @@ create table email_verifications (
 );
 ```
 
-**Note:** The `create_schema()` method is idempotent and can be called multiple times safely.
+**Note:** The `migrate()` method is idempotent and can be called multiple times safely.
 
 ## Public API
 

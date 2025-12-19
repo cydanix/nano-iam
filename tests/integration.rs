@@ -109,11 +109,18 @@ async fn setup_db() -> Result<PgPool, Box<dyn std::error::Error>> {
         sqlx::query(
             r#"
             do $$
+            declare
+                r record;
             begin
-                drop table if exists email_verifications cascade;
-                drop table if exists tokens cascade;
-                drop table if exists accounts cascade;
-                drop type if exists token_type cascade;
+                -- Drop all tables
+                for r in (select tablename from pg_tables where schemaname = 'public') loop
+                    execute 'drop table if exists ' || quote_ident(r.tablename) || ' cascade';
+                end loop;
+                
+                -- Drop all types
+                for r in (select typname from pg_type where typnamespace = (select oid from pg_namespace where nspname = 'public') and typtype = 'e') loop
+                    execute 'drop type if exists ' || quote_ident(r.typname) || ' cascade';
+                end loop;
             end
             $$;
             "#,
@@ -125,8 +132,8 @@ async fn setup_db() -> Result<PgPool, Box<dyn std::error::Error>> {
             IamError::Db(e)
         })?;
 
-        // Create schema
-        repo.create_schema().await?;
+        // Run migrations
+        repo.migrate().await?;
         
         Ok::<(), IamError>(())
     })

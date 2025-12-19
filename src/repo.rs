@@ -507,180 +507,102 @@ limit 1
         Ok(rec)
     }
 
-    /// Create all necessary database tables and types for the IAM service
+    /// Run database migrations
     /// 
-    /// This method is idempotent and safe for concurrent execution across multiple instances.
-    /// It uses PostgreSQL advisory locks (via `LeaseLock`) to ensure only one instance creates
-    /// the schema at a time, and includes retry logic for transient database errors.
-    /// 
-    /// It will create:
-    /// - `token_type` enum type
-    /// - `auth_type` enum type
-    /// - `accounts` table
-    /// - `tokens` table
-    /// - `email_verifications` table
+    /// This method runs SQLx migrations from the `migrations/` directory.
+    /// It uses PostgreSQL advisory locks to ensure only one instance runs migrations at a time.
     /// 
     /// # Concurrency
     /// Multiple instances can call this method simultaneously. The first instance
-    /// will acquire a lock and create the schema. Other instances will wait for the
-    /// lock (up to 30 seconds), then check if the schema already exists (which it will,
-    /// created by the first instance) and return successfully.
+    /// will acquire a lock and run migrations. Other instances will wait for the
+    /// lock (up to 30 seconds), then verify migrations are up to date.
     /// 
     /// # Errors
-    /// Returns `IamError::Db` if there's a database error during schema creation
-    /// after all retries are exhausted.
-    /// Returns `IamError::LockTimeout` if the lock cannot be acquired within the timeout
-    /// and the schema doesn't exist.
-    pub async fn create_schema(&self) -> Result<(), IamError> {
-        info!("Creating IAM database schema (with lock protection)");
+    /// Returns `IamError::Db` if there's a database error during migration execution.
+    /// Returns `IamError::LockTimeout` if the lock cannot be acquired within the timeout.
+    pub async fn migrate(&self) -> Result<(), IamError> {
+        info!("Running database migrations");
         
         // Create a LeaseLock instance using the same pool
         let lock = LeaseLock::new(self.pool.clone());
         
-        // Use a fixed lock key for schema creation
-        let lock_key = "iam_schema_creation";
+        // Use a fixed lock key for migrations
+        let lock_key = "iam_migrations";
         
-        // Try to acquire lock and create schema
-        // If lock acquisition fails (timeout), verify schema exists
+        // Try to acquire lock and run migrations
+        // If lock acquisition fails (timeout), verify migrations are up to date
         match with_lock(&lock, lock_key, 30, || async {
-            self.create_schema_internal().await
+            self.migrate_internal().await
         })
         .await
         {
             Ok(()) => Ok(()),
             Err(IamError::LockTimeout) => {
-                warn!("Failed to acquire schema creation lock within timeout, verifying schema exists");
-                // Another instance might have created it, verify and return success if it exists
-                self.verify_schema_exists().await
+                warn!("Failed to acquire migration lock within timeout, verifying migrations are up to date");
+                // Another instance might have run migrations, verify and return success if up to date
+                self.verify_migrations_up_to_date().await
             }
             Err(e) => Err(e),
         }
     }
 
-    /// Internal method that actually creates the schema
-    /// Called after acquiring the lock, with retry logic for transient errors
-    async fn create_schema_internal(&self) -> Result<(), IamError> {
-        debug!("Executing schema creation SQL");
+    /// Internal method that actually runs migrations
+    /// 
+    /// The `sqlx::migrate!()` macro embeds migrations at compile time.
+    /// The path "src/migrations" is resolved relative to the crate root (CARGO_MANIFEST_DIR)
+    /// when the library is compiled. When this library is used as a dependency in another
+    /// project, the migrations are already embedded in the compiled library, so the path
+    /// works correctly without any additional configuration.
+    async fn migrate_internal(&self) -> Result<(), IamError> {
+        debug!("Executing migrations");
         
-        // Retry the schema creation in case of transient errors
+        // Retry migration execution in case of transient errors
         retry(|| async {
-            sqlx::query(
-                r#"
-                do $$
-                begin
-                    -- Create enum types if they don't exist
-                    if not exists (
-                        select 1 from pg_type 
-                        where typname = 'token_type' 
-                        and typtype = 'e'
-                    ) then
-                        create type token_type as enum ('access', 'refresh');
-                    end if;
-                    
-                    if not exists (
-                        select 1 from pg_type 
-                        where typname = 'auth_type' 
-                        and typtype = 'e'
-                    ) then
-                        create type auth_type as enum ('email', 'google');
-                    end if;
-                    
-                    -- Create accounts table
-                    if not exists (
-                        select 1 from information_schema.tables 
-                        where table_schema = 'public' 
-                        and table_name = 'accounts'
-                    ) then
-                        create table accounts (
-                            id uuid primary key,
-                            email text not null unique,
-                            password_hash text not null,
-                            email_verified boolean not null default false,
-                            auth_type auth_type not null default 'email',
-                            created_at timestamptz not null,
-                            updated_at timestamptz not null,
-                            deleted_at timestamptz
-                        );
-                    end if;
-                    
-                    -- Add auth_type column if it doesn't exist (for existing databases)
-                    if not exists (
-                        select 1 from information_schema.columns 
-                        where table_schema = 'public' 
-                        and table_name = 'accounts' 
-                        and column_name = 'auth_type'
-                    ) then
-                        alter table accounts add column auth_type auth_type not null default 'email';
-                    end if;
-                    
-                    -- Create tokens table
-                    if not exists (
-                        select 1 from information_schema.tables 
-                        where table_schema = 'public' 
-                        and table_name = 'tokens'
-                    ) then
-                        create table tokens (
-                            id uuid primary key,
-                            account_id uuid not null references accounts(id) on delete cascade,
-                            token text not null unique,
-                            token_type token_type not null,
-                            expires_at timestamptz not null,
-                            created_at timestamptz not null,
-                            revoked_at timestamptz,
-                            root_token text,
-                            usage bigint not null default 0
-                        );
-                    end if;
-                    
-                    -- Add root_token and usage columns if they don't exist (for existing databases)
-                    if not exists (
-                        select 1 from information_schema.columns 
-                        where table_schema = 'public' 
-                        and table_name = 'tokens' 
-                        and column_name = 'root_token'
-                    ) then
-                        alter table tokens add column root_token text;
-                    end if;
-                    
-                    if not exists (
-                        select 1 from information_schema.columns 
-                        where table_schema = 'public' 
-                        and table_name = 'tokens' 
-                        and column_name = 'usage'
-                    ) then
-                        alter table tokens add column usage bigint not null default 0;
-                    end if;
-                    
-                    -- Create email_verifications table
-                    if not exists (
-                        select 1 from information_schema.tables 
-                        where table_schema = 'public' 
-                        and table_name = 'email_verifications'
-                    ) then
-                        create table email_verifications (
-                            id uuid primary key,
-                            account_id uuid not null references accounts(id) on delete cascade,
-                            code text not null,
-                            expires_at timestamptz not null,
-                            consumed_at timestamptz,
-                            created_at timestamptz not null
-                        );
-                    end if;
-                end
-                $$;
-                "#,
-            )
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                error!(error = %e, "Failed to create database schema");
-                IamError::Db(e)
-            })
+            // Path is resolved relative to crate root at compile time
+            // Migrations are embedded in the compiled library
+            sqlx::migrate!("src/migrations")
+                .run(&self.pool)
+                .await
+                .map_err(|e| {
+                    error!(error = %e, "Failed to run migrations");
+                    // Convert MigrateError to sqlx::Error
+                    IamError::Db(sqlx::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Migration error: {}", e)
+                    )))
+                })
         })
         .await?;
 
-        info!("IAM database schema created successfully");
+        info!("Database migrations completed successfully");
         Ok(())
+    }
+
+    /// Verify that migrations are up to date
+    async fn verify_migrations_up_to_date(&self) -> Result<(), IamError> {
+        debug!("Verifying migrations are up to date");
+        
+        // Check if the _sqlx_migrations table exists (created by SQLx)
+        let migrations_table_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_name = '_sqlx_migrations'
+            )"
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Failed to verify migrations table");
+            IamError::Db(e)
+        })?;
+
+        if !migrations_table_exists {
+            return Err(IamError::Db(sqlx::Error::RowNotFound));
+        }
+
+        // Verify all required tables exist
+        self.verify_schema_exists().await
     }
 
     /// Verify that the schema already exists

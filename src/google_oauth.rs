@@ -1,11 +1,54 @@
 use std::env;
 use tracing::{error, warn};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use crate::errors::IamError;
+
+/// Custom deserializer that handles both boolean and string "true"/"false" for email_verified
+fn deserialize_email_verified<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct EmailVerifiedVisitor;
+
+    impl<'de> Visitor<'de> for EmailVerifiedVisitor {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a boolean or string \"true\"/\"false\"")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<bool, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<bool, E>
+        where
+            E: de::Error,
+        {
+            match value.to_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(de::Error::invalid_value(
+                    de::Unexpected::Str(value),
+                    &"true or false",
+                )),
+            }
+        }
+    }
+
+    deserializer.deserialize_any(EmailVerifiedVisitor)
+}
 
 #[derive(Debug, Deserialize)]
 struct GoogleTokenInfo {
     email: String,
+    #[serde(deserialize_with = "deserialize_email_verified")]
     email_verified: bool,
     aud: Option<String>, // Audience (client_id)
     #[allow(dead_code)]

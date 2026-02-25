@@ -46,8 +46,20 @@ pub type PgPool = Pool<Postgres>;
 /// Lease lock manager using PostgreSQL advisory locks
 /// 
 /// Provides distributed locking for critical sections in IAM operations.
-/// Uses PostgreSQL advisory locks which work across all database connections
-/// and are automatically released when the connection closes or transaction ends.
+/// Uses PostgreSQL session-level advisory locks (`pg_try_advisory_lock`).
+///
+/// # Connection Pool Caveat
+///
+/// Advisory locks are tied to the database **session** (connection). When using a
+/// connection pool, `try_acquire` and `release` may execute on different connections,
+/// causing `release` to be a no-op. In practice this is acceptable because:
+/// - Lock keys are unique per operation (e.g., per-token, per-account+code)
+/// - Leaked locks are freed when the connection is eventually recycled by the pool
+/// - The critical sections are short-lived, reducing contention window
+///
+/// For stronger guarantees, consider transaction-level locks
+/// (`pg_advisory_xact_lock`) with an explicit transaction held across the
+/// critical section.
 pub struct LeaseLock {
     pool: PgPool,
 }

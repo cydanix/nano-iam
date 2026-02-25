@@ -408,33 +408,14 @@ where root_token = $1
         token: &str,
         token_type: TokenType,
     ) -> Result<Token, IamError> {
-        // First increment the usage counter
-        sqlx::query(
+        let rec = sqlx::query_as::<_, Token>(
             r#"
 update tokens
 set usage = usage + 1
 where token = $1
   and token_type = $2
   and revoked_at is null
-            "#,
-        )
-        .bind(token)
-        .bind(token_type)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            error!(token_type = ?token_type, error = %e, "Database error incrementing token usage");
-            IamError::from(e)
-        })?;
-
-        // Then fetch the updated token
-        let rec = sqlx::query_as::<_, Token>(
-            r#"
-select id, account_id, token, token_type, expires_at, created_at, revoked_at, root_token, usage
-from tokens
-where token = $1
-  and token_type = $2
-  and revoked_at is null
+returning id, account_id, token, token_type, expires_at, created_at, revoked_at, root_token, usage
             "#,
         )
         .bind(token)
@@ -442,14 +423,14 @@ where token = $1
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
-            error!(token_type = ?token_type, error = %e, "Database error fetching token after usage increment");
+            error!(token_type = ?token_type, error = %e, "Database error incrementing token usage");
             IamError::from(e)
         })?;
 
         match rec {
             Some(row) => Ok(row),
             None => {
-                warn!(token_type = ?token_type, "Token not found after usage increment");
+                warn!(token_type = ?token_type, "Token not found for usage increment");
                 Err(IamError::TokenNotFound)
             }
         }

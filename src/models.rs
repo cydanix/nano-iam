@@ -8,6 +8,7 @@ pub type AccountId = Uuid;
 pub struct Account {
     pub id: AccountId,
     pub email: String,
+    #[serde(skip_serializing)]
     pub password_hash: String,
     pub email_verified: bool,
     pub auth_type: AuthType,

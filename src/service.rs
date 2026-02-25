@@ -678,12 +678,27 @@ impl AuthService {
                 IamError::AccountNotFound
             })?;
 
-        if !self.verify_password(password, &account.password_hash)? {
-            warn!(account_id = %account_id, "Account deletion failed: invalid password");
-            return Err(IamError::InvalidCredentials);
+        // Google OAuth accounts don't have passwords; skip verification for them
+        if account.auth_type == AuthType::Email {
+            if !self.verify_password(password, &account.password_hash)? {
+                warn!(account_id = %account_id, "Account deletion failed: invalid password");
+                return Err(IamError::InvalidCredentials);
+            }
         }
 
         let now = self.now();
+        // Revoke all tokens before soft-deleting
+        retry(|| async {
+            self.repo
+                .revoke_all_tokens(account_id, now)
+                .await
+                .map_err(|e| {
+                    error!(account_id = %account_id, error = %e, "Failed to revoke tokens during deletion");
+                    e
+                })
+        })
+        .await?;
+
         // Retry database operations that may fail due to transient errors
         retry(|| async {
             self.repo
@@ -845,27 +860,26 @@ impl AuthService {
     ) -> Result<(), IamError> {
         info!(email = %email, "Requesting password reset");
         
-        let account = self
+        let account = match self
             .repo
             .find_account_by_email(email)
             .await
             .map_err(|e| {
                 error!(email = %email, error = %e, "Database error finding account");
                 e
-            })?
-            .ok_or_else(|| {
-                // Don't reveal if email exists for security
+            })? {
+            Some(acc) => acc,
+            None => {
+                // Don't reveal if email exists -- return Ok silently
                 warn!(email = %email, "Password reset requested for non-existent email");
-                IamError::AccountNotFound
-            })?;
+                return Ok(());
+            }
+        };
 
         let now = self.now();
         let code = self.generate_verification_code(self.cfg.email_verification.code_length);
         let expires_at = now + self.cfg.email_verification.code_ttl;
 
-        // Invalidate any existing password reset codes
-        // (We could add a method to delete old codes, but creating a new one works)
-        
         // Retry database operations that may fail due to transient errors
         retry(|| async {
             self.repo

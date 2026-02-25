@@ -50,9 +50,9 @@ struct GoogleTokenInfo {
     email: String,
     #[serde(deserialize_with = "deserialize_email_verified")]
     email_verified: bool,
-    aud: Option<String>, // Audience (client_id)
+    aud: String,
     #[allow(dead_code)]
-    sub: String, // Subject (user ID) - kept for potential future use
+    sub: String,
 }
 
 /// Verify Google ID token and extract email
@@ -114,12 +114,10 @@ pub async fn verify_google_id_token_with_base_url(
             IamError::InvalidOAuthToken
         })?;
 
-    // Verify the audience (client_id) matches if present
-    if let Some(ref aud) = token_info.aud {
-        if aud != &client_id {
-            warn!("Google token audience mismatch: expected {}, got {}", client_id, aud);
-            return Err(IamError::InvalidOAuthToken);
-        }
+    // Verify the audience (client_id) matches
+    if token_info.aud != client_id {
+        warn!("Google token audience mismatch");
+        return Err(IamError::InvalidOAuthToken);
     }
     
     // Check if email is verified

@@ -42,8 +42,8 @@ CREATE TABLE email_verifications (
 );
 
 -- Create indexes for better query performance
+-- Note: tokens.token and accounts.email already have implicit indexes from UNIQUE constraints
 CREATE INDEX idx_tokens_account_id ON tokens(account_id);
-CREATE INDEX idx_tokens_token ON tokens(token);
 CREATE INDEX idx_tokens_root_token ON tokens(root_token) WHERE root_token IS NOT NULL;
 CREATE INDEX idx_tokens_expires_at ON tokens(expires_at);
 CREATE INDEX idx_tokens_revoked_at ON tokens(revoked_at) WHERE revoked_at IS NOT NULL;
@@ -52,6 +52,5 @@ CREATE INDEX idx_email_verifications_account_id ON email_verifications(account_i
 CREATE INDEX idx_email_verifications_code ON email_verifications(code);
 CREATE INDEX idx_email_verifications_expires_at ON email_verifications(expires_at);
 
-CREATE INDEX idx_accounts_email ON accounts(email);
 CREATE INDEX idx_accounts_deleted_at ON accounts(deleted_at) WHERE deleted_at IS NOT NULL;
 

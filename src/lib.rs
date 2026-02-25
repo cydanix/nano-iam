@@ -18,7 +18,7 @@ pub use crate::service::{
     LoginResult,
     RefreshResult,
 };
-pub use crate::models::{Account, AccountId, AuthType, Token};
+pub use crate::models::{Account, AccountId, AuthType, Role, Token};
 pub use crate::locks::LeaseLock;
 pub use crate::repo::Repo;
 

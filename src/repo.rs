@@ -4,12 +4,13 @@ use uuid::Uuid;
 use tracing::{error, warn, info, debug};
 
 use crate::errors::IamError;
-use crate::models::{Account, AccountId, AuthType, EmailVerification, Token, TokenType};
+use crate::models::{Account, AccountId, AuthType, EmailVerification, Role, Token, TokenType};
 use crate::retry::retry;
 use crate::locks::{LeaseLock, with_lock};
 
 pub type PgPool = Pool<Postgres>;
 
+#[derive(Clone)]
 pub struct Repo {
     pub pool: PgPool,
 }
@@ -746,6 +747,69 @@ limit 1
         );
 
         Ok((deleted_tokens, deleted_verifications, deleted_accounts))
+    }
+
+    // --------------- Roles ---------------
+
+    pub async fn get_role_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Option<Role>, IamError> {
+        sqlx::query_as::<_, Role>(
+            "SELECT id, name, description, created_at FROM roles WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(name = %name, error = %e, "Database error finding role by name");
+            IamError::from(e)
+        })
+    }
+
+    pub async fn get_role_by_id(
+        &self,
+        role_id: Uuid,
+    ) -> Result<Option<Role>, IamError> {
+        sqlx::query_as::<_, Role>(
+            "SELECT id, name, description, created_at FROM roles WHERE id = $1",
+        )
+        .bind(role_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(role_id = %role_id, error = %e, "Database error finding role by id");
+            IamError::from(e)
+        })
+    }
+
+    pub async fn get_permissions_for_role(
+        &self,
+        role_id: Uuid,
+    ) -> Result<Vec<String>, IamError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT permission FROM role_permissions WHERE role_id = $1 ORDER BY permission",
+        )
+        .bind(role_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(role_id = %role_id, error = %e, "Database error fetching role permissions");
+            IamError::from(e)
+        })?;
+        Ok(rows)
+    }
+
+    pub async fn list_roles(&self) -> Result<Vec<Role>, IamError> {
+        sqlx::query_as::<_, Role>(
+            "SELECT id, name, description, created_at FROM roles ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            error!(error = %e, "Database error listing roles");
+            IamError::from(e)
+        })
     }
 }
 
